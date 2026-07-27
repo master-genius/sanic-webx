@@ -1,0 +1,582 @@
+"""HTTP 端到端：真起应用 + 真查库，跑完整的注册 → 登录 → 个人中心链路。
+
+与 test_auth_db（服务层）互补：这里验证的是**中间件链 + DTO 校验 + 路由**这一层，
+即"从 HTTP 请求到落库"整条路是否接通。
+"""
+
+import pytest
+
+
+@pytest.fixture(scope="module")
+def http_app(app_with_db):
+    """复用会话级应用（一个进程只能装配一个，见 conftest.app_with_db）。"""
+    return app_with_db
+
+
+def _register_user(app, captured_codes_module, username, email):
+    """走完整的「发码 → 注册」两步，返回注册响应。"""
+    _, sent = app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": email, "channel_type": "email", "biz_type": "register"},
+    )
+    assert sent.status == 200
+
+    return app.test_client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "password": "secret123",
+            "email": email,
+            "code": captured_codes_module[-1]["code"],
+        },
+    )[1]
+
+
+# ==================== 注册 / 登录 ====================
+
+
+def test_register_then_login(http_app, captured_codes_module):
+    reg = _register_user(http_app, captured_codes_module, "e2euser", "e2e@example.com")
+    assert reg.status == 201
+    assert reg.json["data"]["user"]["username"] == "e2euser"
+
+    _, login = http_app.test_client.post(
+        "/auth/login", json={"username": "e2euser", "password": "secret123"}
+    )
+    assert login.status == 200
+    assert login.json["data"]["token"]
+    # 响应里的邮箱必须是脱敏的
+    assert login.json["data"]["user"]["email"] != "e2e@example.com"
+
+
+def test_register_requires_exactly_one_channel(http_app):
+    """DTO 层就该挡住「邮箱手机同填/同空」，返回 400。"""
+    _, both = http_app.test_client.post(
+        "/auth/register",
+        json={
+            "username": "x1", "password": "secret123",
+            "email": "a@b.c", "mobile": "13800138000", "code": "123456",
+        },
+    )
+    assert both.status == 400
+
+    _, neither = http_app.test_client.post(
+        "/auth/register",
+        json={"username": "x2", "password": "secret123", "code": "123456"},
+    )
+    assert neither.status == 400
+
+
+def test_register_rejects_wrong_code(http_app, captured_codes_module):
+    http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": "w@example.com", "channel_type": "email", "biz_type": "register"},
+    )
+    _, resp = http_app.test_client.post(
+        "/auth/register",
+        json={
+            "username": "wrongcode", "password": "secret123",
+            "email": "w@example.com", "code": "000000",
+        },
+    )
+    assert resp.status == 400
+
+
+def test_login_rejects_bad_password(http_app, captured_codes_module):
+    _register_user(http_app, captured_codes_module, "e2euser2", "e2e2@example.com")
+    _, resp = http_app.test_client.post(
+        "/auth/login", json={"username": "e2euser2", "password": "wrong-pass"}
+    )
+    assert resp.status == 401
+
+
+def test_mobile_channel_blocked_when_unregistered(http_app):
+    """短信通道没注册时，发码端点必须明确拒绝而不是 500。"""
+    _, resp = http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": "13800138000", "channel_type": "mobile", "biz_type": "register"},
+    )
+    assert resp.status == 400
+
+
+# ==================== 个人中心（需登录）====================
+
+
+def _login_token(app, captured_codes_module, username, email):
+    _register_user(app, captured_codes_module, username, email)
+    _, login = app.test_client.post(
+        "/auth/login", json={"username": username, "password": "secret123"}
+    )
+    return login.json["data"]["token"]
+
+
+def test_profile_requires_auth(http_app):
+    _, resp = http_app.test_client.get("/api/user/info")
+    assert resp.status == 401
+
+
+def test_profile_info_and_password_change(http_app, captured_codes_module):
+    token = _login_token(http_app, captured_codes_module, "profileuser", "profile@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    _, info = http_app.test_client.get("/api/user/info", headers=headers)
+    assert info.status == 200
+    assert info.json["data"]["username"] == "profileuser"
+    # 完整资料接口返回真实邮箱（本人查看自己的信息，无需脱敏）
+    assert info.json["data"]["email"] == "profile@example.com"
+
+    # 旧密码错 → 400
+    _, bad = http_app.test_client.put(
+        "/api/user/passwd",
+        headers=headers,
+        json={"old_password": "nope-nope", "new_password": "brandnew1"},
+    )
+    assert bad.status == 400
+
+    _, ok = http_app.test_client.put(
+        "/api/user/passwd",
+        headers=headers,
+        json={"old_password": "secret123", "new_password": "brandnew1"},
+    )
+    assert ok.status == 200
+
+    _, relogin = http_app.test_client.post(
+        "/auth/login", json={"username": "profileuser", "password": "brandnew1"}
+    )
+    assert relogin.status == 200
+
+
+def test_username_change_requires_password(http_app, captured_codes_module):
+    token = _login_token(http_app, captured_codes_module, "e2euser3", "e2e3@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    _, bad = http_app.test_client.put(
+        "/api/user/username",
+        headers=headers,
+        json={"password": "wrong-pass", "new_username": "renamed"},
+    )
+    assert bad.status == 400
+
+    _, ok = http_app.test_client.put(
+        "/api/user/username",
+        headers=headers,
+        json={"password": "secret123", "new_username": "renamed"},
+    )
+    assert ok.status == 200
+
+
+def test_logout_and_refresh(http_app, captured_codes_module):
+    token = _login_token(http_app, captured_codes_module, "e2euser4", "e2e4@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    _, out = http_app.test_client.post("/auth/logout", headers=headers)
+    assert out.status == 200
+
+    _, refreshed = http_app.test_client.post("/auth/refresh", headers=headers)
+    assert refreshed.status == 200
+    assert refreshed.json["data"]["token"]
+
+
+# ==================== 管理端 ====================
+
+
+def test_admin_endpoints_reject_user_token(http_app, captured_codes_module):
+    """C 端令牌打不开管理端——admin_auth_middleware 要求 role == admin。"""
+    token = _login_token(http_app, captured_codes_module, "e2euser5", "e2e5@example.com")
+    _, resp = http_app.test_client.get(
+        "/api/admin/account/", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status == 403
+
+
+def test_admin_endpoints_reject_anonymous(http_app):
+    _, resp = http_app.test_client.get("/api/admin/role/")
+    assert resp.status == 401
+
+
+def test_admin_login_rejects_unknown(http_app):
+    """不存在的管理员必须 401（且不泄露"用户不存在"以外的信息）。"""
+    _, resp = http_app.test_client.post(
+        "/auth/admin-login", json={"username": "nobody", "password": "secret123"}
+    )
+    assert resp.status == 401
+
+
+# ==================== 文件上传 / 下载 ====================
+
+
+def _multipart(filename: str, content: bytes) -> tuple[bytes, dict]:
+    """手工拼一个最小 multipart 体——测试要控制原始字节，不走高层封装。"""
+    boundary = "----webxtestboundary"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode() + content + f"\r\n--{boundary}--\r\n".encode()
+    return body, {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+
+
+def _auth(app, codes, username, email) -> dict:
+    return {"Authorization": f"Bearer {_login_token(app, codes, username, email)}"}
+
+
+def test_file_upload_download_roundtrip(http_app, captured_codes_module):
+    headers = _auth(http_app, captured_codes_module, "fileuser", "file@example.com")
+    content = b"hello-webx-storage" * 100
+    body, ct = _multipart("demo.bin", content)
+
+    _, up = http_app.test_client.post(
+        "/api/files/bucket1", data=body, headers={**headers, **ct}
+    )
+    assert up.status == 201, up.text
+    assert up.json["data"]["filename"] == "demo.bin"
+    assert up.json["data"]["size"] == len(content)
+
+    _, down = http_app.test_client.get("/api/files/bucket1/demo.bin", headers=headers)
+    assert down.status == 200
+    assert down.body == content
+    assert down.headers["Accept-Ranges"] == "bytes"
+
+    _, listing = http_app.test_client.get("/api/files/bucket1", headers=headers)
+    assert listing.json["data"]["files"] == ["demo.bin"]
+
+
+def test_file_endpoints_require_auth(http_app):
+    _, resp = http_app.test_client.get("/api/files/bucket1")
+    assert resp.status == 401
+
+
+def test_download_supports_range(http_app, captured_codes_module):
+    """下载断点续传：206 + Content-Range，且内容确为该区间。"""
+    headers = _auth(http_app, captured_codes_module, "rangeuser", "range@example.com")
+    content = bytes(range(256))
+    body, ct = _multipart("bytes.bin", content)
+    http_app.test_client.post("/api/files/rng", data=body, headers={**headers, **ct})
+
+    _, resp = http_app.test_client.get(
+        "/api/files/rng/bytes.bin", headers={**headers, "Range": "bytes=10-19"}
+    )
+    assert resp.status == 206
+    assert resp.body == content[10:20]
+    assert "bytes 10-19/256" in resp.headers["Content-Range"]
+
+
+def test_download_range_beyond_eof_is_416(http_app, captured_codes_module):
+    headers = _auth(http_app, captured_codes_module, "r416user", "r416@example.com")
+    body, ct = _multipart("small.bin", b"0123456789")
+    http_app.test_client.post("/api/files/r416", data=body, headers={**headers, **ct})
+
+    _, resp = http_app.test_client.get(
+        "/api/files/r416/small.bin", headers={**headers, "Range": "bytes=999-"}
+    )
+    assert resp.status == 416
+    assert resp.headers["Content-Range"] == "bytes */10"
+
+
+def test_signed_public_download(http_app, captured_codes_module):
+    """签发限时链接 → 无需登录即可下载。"""
+    headers = _auth(http_app, captured_codes_module, "signuser", "sign@example.com")
+    content = b"public-content"
+    body, ct = _multipart("pub.txt", content)
+    http_app.test_client.post("/api/files/pub", data=body, headers={**headers, **ct})
+
+    _, signed = http_app.test_client.post(
+        "/api/files/pub/pub.txt/sign", json={"ttl_seconds": 600}, headers=headers
+    )
+    assert signed.status == 200
+    sign = signed.json["data"]["sign"]
+
+    _, down = http_app.test_client.get(f"/public/files/pub/pub.txt?sign={sign}")
+    assert down.status == 200
+    assert down.body == content
+
+
+def test_public_download_rejects_bad_or_missing_sign(http_app, captured_codes_module):
+    """签名无效一律 404——不能用 403 泄露「该文件存在」。"""
+    headers = _auth(http_app, captured_codes_module, "badsign", "badsign@example.com")
+    body, ct = _multipart("secret.txt", b"x")
+    http_app.test_client.post("/api/files/sec", data=body, headers={**headers, **ct})
+
+    _, no_sign = http_app.test_client.get("/public/files/sec/secret.txt")
+    assert no_sign.status == 404
+
+    _, bad_sign = http_app.test_client.get("/public/files/sec/secret.txt?sign=garbage")
+    assert bad_sign.status == 404
+
+
+def test_signed_url_cannot_be_moved_to_another_file(http_app, captured_codes_module):
+    headers = _auth(http_app, captured_codes_module, "mover", "mover@example.com")
+    for name in ("mine.txt", "yours.txt"):
+        body, ct = _multipart(name, b"data")
+        http_app.test_client.post("/api/files/mv", data=body, headers={**headers, **ct})
+
+    _, signed = http_app.test_client.post("/api/files/mv/mine.txt/sign", headers=headers)
+    sign = signed.json["data"]["sign"]
+
+    _, moved = http_app.test_client.get(f"/public/files/mv/yours.txt?sign={sign}")
+    assert moved.status == 404, "签名必须与对象键绑定"
+
+
+def test_chunked_upload_over_http(http_app, captured_codes_module):
+    """分片上传全链路：init → 两片 → complete → 下载校验。"""
+    headers = _auth(http_app, captured_codes_module, "chunker", "chunk@example.com")
+
+    _, init = http_app.test_client.post(
+        "/api/files/big/uploads", json={"filename": "big.bin", "total": 8}, headers=headers
+    )
+    assert init.status == 201
+    uid = init.json["data"]["upload_id"]
+
+    _, p1 = http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"abcd",
+        headers={**headers, "Upload-Offset": "0"},
+    )
+    assert p1.json["data"]["offset"] == 4
+
+    _, status = http_app.test_client.get(f"/api/files/uploads/{uid}", headers=headers)
+    assert status.json["data"]["offset"] == 4
+
+    _, p2 = http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"efgh",
+        headers={**headers, "Upload-Offset": "4"},
+    )
+    assert p2.json["data"]["offset"] == 8
+
+    _, done = http_app.test_client.post(
+        f"/api/files/uploads/{uid}/complete", headers=headers
+    )
+    assert done.status == 200
+    assert done.json["data"]["key"] == "big/big.bin"
+
+    _, down = http_app.test_client.get("/api/files/big/big.bin", headers=headers)
+    assert down.body == b"abcdefgh"
+
+
+def test_chunked_offset_conflict_returns_real_offset(http_app, captured_codes_module):
+    headers = _auth(http_app, captured_codes_module, "conflict", "conflict@example.com")
+    _, init = http_app.test_client.post(
+        "/api/files/cf/uploads", json={"filename": "c.bin"}, headers=headers
+    )
+    uid = init.json["data"]["upload_id"]
+    http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"abc", headers={**headers, "Upload-Offset": "0"}
+    )
+
+    _, dup = http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"abc", headers={**headers, "Upload-Offset": "0"}
+    )
+    assert dup.status == 409
+    assert dup.json["offset"] == 3, "要把真实 offset 回给客户端以便重新对齐"
+
+
+def test_delete_file(http_app, captured_codes_module):
+    headers = _auth(http_app, captured_codes_module, "deleter", "del@example.com")
+    body, ct = _multipart("gone.txt", b"x")
+    http_app.test_client.post("/api/files/del", data=body, headers={**headers, **ct})
+
+    _, resp = http_app.test_client.delete("/api/files/del/gone.txt", headers=headers)
+    assert resp.status == 200
+
+    _, again = http_app.test_client.delete("/api/files/del/gone.txt", headers=headers)
+    assert again.status == 404
+
+
+def test_upload_rejects_path_traversal_filename(http_app, captured_codes_module):
+    """恶意文件名必须被存储层挡住，不能写到 bucket 之外。"""
+    headers = _auth(http_app, captured_codes_module, "traverse", "trav@example.com")
+    body, ct = _multipart("../../escaped.txt", b"pwned")
+
+    _, resp = http_app.test_client.post(
+        "/api/files/tv", data=body, headers={**headers, **ct}
+    )
+    assert resp.status in (400, 403), resp.text
+
+
+# ==================== 找回密码 / 改名改密（邮箱 or 手机）====================
+
+
+def test_change_by_code_via_email(http_app, captured_codes_module):
+    """邮箱渠道：发 change 码 → 凭码改密 → 新密码可登录。"""
+    _register_user(http_app, captured_codes_module, "chguser", "chg@example.com")
+
+    http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": "chg@example.com", "channel_type": "email", "biz_type": "change"},
+    )
+    _, resp = http_app.test_client.post(
+        "/auth/account/change-by-code",
+        json={
+            "email": "chg@example.com",
+            "code": captured_codes_module[-1]["code"],
+            "new_password": "changed123",
+        },
+    )
+    assert resp.status == 200, resp.text
+
+    _, login = http_app.test_client.post(
+        "/auth/login", json={"username": "chguser", "password": "changed123"}
+    )
+    assert login.status == 200
+
+
+def test_change_by_code_requires_exactly_one_channel(http_app):
+    """邮箱手机同填/同空都该被 DTO 挡在 400。"""
+    _, both = http_app.test_client.post(
+        "/auth/account/change-by-code",
+        json={
+            "email": "a@b.c", "mobile": "13800138000",
+            "code": "123456", "new_password": "whatever1",
+        },
+    )
+    assert both.status == 400
+
+    _, neither = http_app.test_client.post(
+        "/auth/account/change-by-code",
+        json={"code": "123456", "new_password": "whatever1"},
+    )
+    assert neither.status == 400
+
+
+def test_change_by_code_requires_something_to_change(http_app):
+    """只给身份不给新值，等于什么都没让改。"""
+    _, resp = http_app.test_client.post(
+        "/auth/account/change-by-code",
+        json={"email": "a@b.c", "code": "123456"},
+    )
+    assert resp.status == 400
+
+
+def test_change_by_code_mobile_blocked_without_sms(http_app):
+    """短信通道未注册时，手机找回要给明确提示而不是让用户干等验证码。"""
+    _, resp = http_app.test_client.post(
+        "/auth/account/change-by-code",
+        json={"mobile": "13800138000", "code": "123456", "new_password": "whatever1"},
+    )
+    assert resp.status == 400
+    assert "短信" in resp.json["error"]
+
+
+def test_change_by_code_unknown_account_is_404(http_app):
+    _, resp = http_app.test_client.post(
+        "/auth/account/change-by-code",
+        json={"email": "nobody@example.com", "code": "123456", "new_password": "whatever1"},
+    )
+    assert resp.status == 404
+
+
+def test_mobile_register_and_change_by_code(http_app, captured_codes_module):
+    """手机渠道全链路：注册 → 找回改密 → 新密码登录。
+
+    这是本次同步新增的能力，必须真跑一遍——只测「没短信时被挡住」覆盖不到它。
+    测试里临时注册一个假的短信通道，用完还原。
+    """
+    from webx.lib import senders
+
+    sent: list[dict] = []
+
+    async def fake_sms(identifier, code, *, valid_minutes, biz_type="", **_):
+        sent.append({"identifier": identifier, "code": code})
+
+    original = senders.get_sender("mobile")
+    senders.register_sender("mobile", fake_sms)
+    try:
+        mobile = "13800138001"
+
+        # ① 手机注册
+        http_app.test_client.post(
+            "/auth/verifycode",
+            json={"identifier": mobile, "channel_type": "mobile", "biz_type": "register"},
+        )
+        assert sent, "短信通道应已收到注册验证码"
+
+        _, reg = http_app.test_client.post(
+            "/auth/register",
+            json={
+                "username": "mobuser",
+                "password": "secret123",
+                "mobile": mobile,
+                "code": sent[-1]["code"],
+            },
+        )
+        assert reg.status == 201, reg.text
+        assert reg.json["data"]["user"]["mobile"] == mobile
+
+        # ② 凭手机验证码改密（找回密码）
+        http_app.test_client.post(
+            "/auth/verifycode",
+            json={"identifier": mobile, "channel_type": "mobile", "biz_type": "change"},
+        )
+        _, resp = http_app.test_client.post(
+            "/auth/account/change-by-code",
+            json={"mobile": mobile, "code": sent[-1]["code"], "new_password": "bymobile1"},
+        )
+        assert resp.status == 200, resp.text
+
+        # ③ 新密码可登录，且手机号本身也能当登录标识
+        _, login = http_app.test_client.post(
+            "/auth/login", json={"username": mobile, "password": "bymobile1"}
+        )
+        assert login.status == 200
+    finally:
+        if original is not None:
+            senders.register_sender("mobile", original)
+        else:
+            senders.unregister_sender("mobile")
+
+
+# ==================== 找回密码发码：账号存在性前置闸 ====================
+
+
+def test_change_code_rejects_unregistered_account(http_app, captured_codes_module):
+    """未注册的标识不该收到找回码——也不该白发一封邮件出去。"""
+    before = len(captured_codes_module)
+
+    _, resp = http_app.test_client.post(
+        "/auth/verifycode",
+        json={
+            "identifier": "never-registered@example.com",
+            "channel_type": "email",
+            "biz_type": "change",
+        },
+    )
+    assert resp.status == 404
+    assert "未注册" in resp.json["error"]
+    assert len(captured_codes_module) == before, "不得向未注册标识投递验证码"
+
+
+def test_change_code_reports_format_error_before_existence(http_app):
+    """格式非法要报格式错，不能误报「未注册」——否则用户被误导去注册。"""
+    _, resp = http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": "not-an-email", "channel_type": "email", "biz_type": "change"},
+    )
+    assert resp.status == 400
+    assert "格式" in resp.json["error"]
+
+
+def test_change_code_passes_for_registered_account(http_app, captured_codes_module):
+    _register_user(http_app, captured_codes_module, "gateuser", "gate@example.com")
+    before = len(captured_codes_module)
+
+    _, resp = http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": "gate@example.com", "channel_type": "email", "biz_type": "change"},
+    )
+    assert resp.status == 200
+    assert len(captured_codes_module) == before + 1
+
+
+def test_register_and_login_codes_still_reach_unregistered(http_app, captured_codes_module):
+    """这道闸**只**管 change：注册/登录码本来就得发往未注册标识，不能被误伤。"""
+    for biz in ("register", "login"):
+        before = len(captured_codes_module)
+        _, resp = http_app.test_client.post(
+            "/auth/verifycode",
+            json={
+                "identifier": f"fresh-{biz}@example.com",
+                "channel_type": "email",
+                "biz_type": biz,
+            },
+        )
+        assert resp.status == 200, f"{biz} 被误伤: {resp.text}"
+        assert len(captured_codes_module) == before + 1
