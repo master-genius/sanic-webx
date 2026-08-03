@@ -86,7 +86,7 @@ def test_valid_token_passes_auth_middleware(test_app):
 
 def test_role_gate_blocks_non_admin(test_app):
     """角色闸门：user 角色的令牌打不开 admin 中间件。"""
-    from webx.core.middleware import make_auth_middleware
+    from webx.middleware import make_auth_middleware
 
     from sanic import Blueprint
     from sanic.response import json as sjson

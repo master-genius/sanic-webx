@@ -6,7 +6,7 @@
 
 from sanic import Request
 
-from webx.core.guards import get_client_ip
+from webx.lib.client_ip import get_client_ip
 
 
 async def client_ip(request: Request) -> None:

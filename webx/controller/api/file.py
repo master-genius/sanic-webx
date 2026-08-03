@@ -22,7 +22,7 @@ from sanic.request import Request
 from sanic.response import json
 
 from webx.config import settings
-from webx.core.i18n import get_lang_from_header, t
+from webx.i18n import get_lang_from_header, t
 from webx.lib.chunked_upload import OffsetConflict
 from webx.lib.storage import StoreError
 from webx.services.storage_service import storage_service

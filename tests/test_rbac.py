@@ -7,7 +7,7 @@
 import asyncio
 import types
 
-from webx.core.middleware import is_privileged, make_has_permission, require_permission
+from webx.middleware import is_privileged, make_has_permission, require_permission
 from webx.services.init_permission import init_permissions
 from webx.lib.permissions import PERMISSIONS, clear, register_module, register_permissions
 

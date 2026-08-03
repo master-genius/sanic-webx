@@ -6,7 +6,7 @@ from sanic import Blueprint
 from sanic.response import json
 
 from webx.core.errors import NotFoundError
-from webx.core.i18n import t
+from webx.i18n import t
 
 from app.models import Note
 

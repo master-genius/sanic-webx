@@ -28,7 +28,7 @@ import logging
 from sanic import Request
 from sanic.response import json
 
-from webx.core.i18n import get_lang_from_header, t
+from webx.i18n import get_lang_from_header, t
 
 logger = logging.getLogger(__name__)
 

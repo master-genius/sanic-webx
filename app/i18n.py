@@ -1,6 +1,6 @@
 """业务文案注册。框架文案已内置，这里只加自己的。"""
 
-from webx.core.i18n import register
+from webx.i18n import register
 
 register("zh", {
     "note_created": "笔记已创建",

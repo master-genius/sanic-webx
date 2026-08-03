@@ -6,7 +6,7 @@
 
 业务项目 app/i18n.py::
 
-    from webx.core.i18n import register
+    from webx.i18n import register
 
     register("zh", {
         "order_created": "订单已创建",

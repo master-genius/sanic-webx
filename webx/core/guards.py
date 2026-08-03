@@ -1,7 +1,7 @@
 """路由级守卫装饰器。
 
 与中间件的分工：
-  - **中间件**（``core.middleware``）按目录批量生效，适合"整组接口都要登录"
+  - **中间件**（``webx.middleware``）按目录批量生效，适合"整组接口都要登录"
   - **装饰器**（本模块）按单个路由生效，适合同一目录下混合公开/受限接口
     （典型如 auth 目录：login/register 公开，logout/refresh 需登录）
 
@@ -18,9 +18,18 @@ from sanic.request import Request
 from sanic.response import json
 
 from webx.config import settings
-from webx.core.i18n import get_lang_from_header, t
-from webx.core.middleware import DEFAULT_CLAIMS
+from webx.i18n import get_lang_from_header, t
+from webx.lib.client_ip import get_client_ip
 from webx.lib.token import get_token
+from webx.middleware.auth import DEFAULT_CLAIMS
+
+__all__ = [
+    "require_internal_token",
+    "require_token",
+    "optional_token",
+    "get_client_ip",
+    "with_client_ip",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -122,30 +131,8 @@ def optional_token(
 
 # ==================== 客户端真实 IP（反代感知） ====================
 
-
-def get_client_ip(request: Request) -> str:
-    """解析真实客户端 IP（服务通常部署在反向代理之后）。
-
-    优先级：``X-Real-IP`` → ``X-Forwarded-For``（取最左 = 原始客户端）→
-    ``request.ip``（socket 对端，兜底）。Sanic 的 headers 查找本身大小写不敏感。
-
-    ⚠️ 这些头可被客户端伪造，只有在**你自己的反代确实会覆写它们**时才可信；
-    直接暴露在公网的服务不要拿它做安全判定。
-
-    健壮性：任何异常都降级返回，绝不外抛——IP 解析失败不该影响主流程。
-    """
-    try:
-        ip = request.headers.get("x-real-ip")
-        if not ip:
-            xff = request.headers.get("x-forwarded-for")
-            if xff:
-                ip = xff.split(",")[0]
-        return (ip or request.ip or "").strip()
-    except Exception:
-        try:
-            return request.ip or ""
-        except Exception:
-            return ""
+# 解析逻辑本体在 ``webx.lib.client_ip``（中间件与本模块共用，见那里的说明），
+# 此处仅原样再导出，老代码 ``from webx.core.guards import get_client_ip`` 不受影响。
 
 
 def with_client_ip(f: Callable) -> Callable:

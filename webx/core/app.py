@@ -26,9 +26,9 @@ from webx.core.auto_blueprint import auto_register_blueprints
 from webx.config import settings
 from webx.core.db import close_db, init_db
 from webx.core.errors import setup_error_handlers
-from webx.core.i18n import get_lang_from_header, t
+from webx.i18n import get_lang_from_header, t
 from webx.core.log_config import setup_logging
-from webx.core.middleware import setup_cors
+from webx.middleware import setup_cors
 
 logger = logging.getLogger(__name__)
 

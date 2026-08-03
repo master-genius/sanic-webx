@@ -1,137 +1,36 @@
-"""中间件：认证、角色权限加载、CORS。
+"""阶段 2/3：权限加载中间件 + 路由级校验装饰器 + 公共判权工具。
 
-**中间件直接依赖 models / services 是正常的**，那是框架内部的分层依赖，
-不需要为此套注入接缝。
+三者同处一个模块是「一个中间件一个模块」的**唯一例外**，理由是数据契约同源：
 
-认证三阶段：
+  - ``role_perm_middleware`` 负责**写** ``ctx.permissions`` / ``user_permissions`` /
+    ``has_permission`` / ``org_roles`` / ``is_root``；
+  - ``require_permission`` 与 ``has_perm`` / ``is_privileged`` 负责**读**同一批字段。
 
-  1. ``auth_middleware`` —— 只验令牌、注入 ``ctx.user``（不查库）
-  2. ``role_perm_middleware`` —— 查库加载组织角色权限 + 用户单独权限
-  3. ``@require_permission`` —— 路由级判定（super / 组织超管自动放行）
+拆成两个文件只会让二者互相 import，且契约变更时容易只改一半。
 
-挂载（目录的 ``__mid__.py``）::
-
-    MIDDLEWARES = [auth_middleware]                              # 普通用户接口
-    MIDDLEWARES = [admin_auth_middleware, role_perm_middleware]  # 管理端接口
-
-⚠️ 顺序不可颠倒：``role_perm_middleware`` 只读 ``ctx.user["user_id"]``，
+⚠️ 必须挂在认证中间件之后：本模块只读 ``ctx.user["user_id"]``，
 令牌无效在上一道即已 401。
 """
 
 from __future__ import annotations
 
 from functools import wraps
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Callable
 
-from sanic import Request, response
+from sanic import Request
 from sanic.response import json
 
-from webx.config import settings
-from webx.core.i18n import get_lang_from_header, t
-from webx.lib.token import get_token
+from webx.i18n import get_lang_from_header, t
 from webx.models.rbac import RolePermission, UserOrg, UserPermission, UserRole
-
-# 从 token payload 透传到 request.ctx.user 的字段。
-# ⚠️ 这里的 ``sys_root`` 是**系统级**超管（Admin.is_root），与
-# ``role_perm_middleware`` 注入的 ``ctx.is_root``（**组织内**超管，UserOrg.is_root）
-# 是两个概念——刻意用不同名字，避免同一个 key 因中间件链不同而含义漂移。
-DEFAULT_CLAIMS = ("user_id", "username", "role", "org_id", "sys_root")
-
-
-def _unauthorized(request: Request, key: str, **extra) -> response.HTTPResponse:
-    lang = get_lang_from_header(request.headers)
-    return response.json({"error": t(key, lang), **extra}, status=401)
-
-
-def make_auth_middleware(
-    *,
-    claims: Iterable[str] = DEFAULT_CLAIMS,
-    required_roles: Iterable[str] | None = None,
-    forbidden_status: int = 403,
-) -> Callable[[Request], Awaitable[Any]]:
-    """构造一条认证中间件。
-
-    行为：取 Bearer token → 解密校验 → 把 payload 里的 claims 注入
-    ``request.ctx.user``。不查库（令牌自带身份，查库交给下游按需做）。
-
-    Args:
-        claims: 透传到 ctx.user 的 payload 字段名。
-        required_roles: 非空时校验 payload 的 ``role``（大小写/空白不敏感）。
-        forbidden_status: 角色不匹配时的状态码。传 ``404`` 可**隐藏接口存在性**
-            （403 会泄露"有个你没权限的接口"，内部接口建议用 404）。
-
-    Returns:
-        Sanic request 中间件。返回 response 即短路，handler 不会执行。
-    """
-    claim_keys = tuple(claims)
-    roles = {r.strip().lower() for r in required_roles} if required_roles else None
-
-    async def middleware(request: Request):
-        auth_header = request.headers.get("Authorization") or ""
-        if not auth_header.startswith("Bearer "):
-            return _unauthorized(request, "unauthorized")
-
-        result = get_token().verify_token(auth_header[7:])
-        if not result.get("ok"):
-            errcode = result.get("errcode", "FAILED")
-            key = "token_expired" if errcode == "TIMEOUT" else "token_invalid"
-            return _unauthorized(request, key, code=errcode)
-
-        payload = result.get("data") or {}
-
-        if roles is not None:
-            role = str(payload.get("role") or "").strip().lower()
-            if role not in roles:
-                lang = get_lang_from_header(request.headers)
-                key = "not_found" if forbidden_status == 404 else "forbidden"
-                return response.json({"error": t(key, lang)}, status=forbidden_status)
-
-        request.ctx.token_payload = payload
-        request.ctx.user = {k: payload.get(k) for k in claim_keys}
-
-    return middleware
-
-
-def make_role_middleware(
-    *allowed_roles: str,
-    status: int = 403,
-) -> Callable[[Request], Awaitable[Any]]:
-    """角色守卫：只放行指定角色，否则按 ``status`` 短路。
-
-    **必须挂在认证中间件之后**——它只读 ``request.ctx.user["role"]``，不自己验令牌
-    （令牌无效在上一道即已 401）。
-
-    ``status=404`` 是内部接口的推荐用法：对非授权用户完全不暴露该接口的存在。
-    """
-    roles = {r.strip().lower() for r in allowed_roles}
-
-    async def middleware(request: Request):
-        user = getattr(request.ctx, "user", None) or {}
-        role = str(user.get("role") or "").strip().lower()
-        if role not in roles:
-            lang = get_lang_from_header(request.headers)
-            key = "not_found" if status == 404 else "forbidden"
-            return response.json({"error": t(key, lang)}, status=status)
-
-    return middleware
-
-
-# ── 开箱即用的实例 ────────────────────────────────────────────────
-
-auth_middleware = make_auth_middleware()
-"""标准用户认证：验令牌、注入 ctx.user。"""
-
-admin_auth_middleware = make_auth_middleware(required_roles=["admin"])
-"""管理端认证：在标准认证之上要求 role == admin。"""
-
-
-# ══════════════════ 阶段 2：角色权限加载（查库）══════════════════
 
 # 拥有该角色即无条件放行（组织内最高权限）
 SUPER_ROLE = "super"
 
 # 指定组织的请求头。多组织项目由前端切换，单组织项目忽略即可。
 ORG_HEADER = "x-orgid"
+
+
+# ══════════════════ 阶段 2：角色权限加载（查库）══════════════════
 
 
 def make_has_permission(
@@ -226,6 +125,9 @@ async def role_perm_middleware(request: Request) -> None:
     user_info["has_permission"] = checker
 
 
+# ══════════════════ 公共判权工具 ══════════════════
+
+
 def is_privileged(request: Request) -> bool:
     """在**当前组织内**是否为无条件放行身份：组织超管或 ``super`` 角色。
 
@@ -293,47 +195,3 @@ def require_permission(*perm_names: str) -> Callable:
         return wrapper
 
     return decorator
-
-
-# ── CORS ─────────────────────────────────────────────────────────
-
-
-def build_cors_headers(request: Request) -> dict[str, str]:
-    """按配置构造 CORS 响应头。
-
-    - dev 环境（``APP_ENV=dev``）放开所有来源，方便本地联调
-    - 生产环境只回显命中 ``CORS_ALLOWED_ORIGINS`` 白名单的 Origin
-
-    ⚠️ ``Allow-Headers`` 必须显式列出 ``Authorization``——按 Fetch 规范
-    通配符 ``*`` 不覆盖 Authorization。
-    """
-    origin = request.headers.get("Origin", "")
-
-    common = {
-        "Access-Control-Allow-Methods": settings.CORS_ALLOW_METHODS,
-        "Access-Control-Allow-Headers": settings.CORS_ALLOW_HEADERS,
-        "Access-Control-Max-Age": "86400",
-    }
-
-    if settings.is_dev:
-        return {"Access-Control-Allow-Origin": "*", **common}
-
-    if origin and origin in settings.CORS_ALLOWED_ORIGINS:
-        return {"Access-Control-Allow-Origin": origin, **common}
-
-    # 未配置白名单或 Origin 不在名单内：不回 CORS 头，浏览器自行拦截
-    return {}
-
-
-def setup_cors(app) -> None:
-    """为应用注册 CORS：预检短路 + 响应头注入。"""
-
-    @app.middleware("request")
-    async def _cors_preflight(request: Request):
-        if request.method == "OPTIONS":
-            return response.text("", headers=build_cors_headers(request))
-
-    @app.middleware("response")
-    async def _cors_headers(request: Request, resp):
-        for key, value in build_cors_headers(request).items():
-            resp.headers[key] = value

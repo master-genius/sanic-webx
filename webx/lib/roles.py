@@ -10,7 +10,7 @@
     })
 
 注意与 C 端 ``User.role``（user / vip 等粗粒度标识）无关，那是另一维。
-``super`` 是 rbac 的无条件放行角色（见 `webx.core.middleware.SUPER_ROLE`），
+``super`` 是 rbac 的无条件放行角色（见 `webx.middleware.SUPER_ROLE`），
 删掉它会让 rbac 的超管放行失效。
 """
 

@@ -8,17 +8,25 @@
 
     paths       项目根定位，零依赖
     config      BaseSettings，只依赖 paths + environs
+    i18n        文案注册与取用，零依赖
     lib         纯工具：令牌 / 哈希 / ID / 表结构同步 / 邮件 / 短信，零 ORM
     models      Tortoise 模型 + DTO
     services    业务逻辑，查库
-    core        应用骨架：蓝图扫描、中间件、应用工厂、ORM 初始化、异常、i18n、日志
-    middleware  可插拔中间件
+    middleware  可插拔中间件（鉴权那几条要查库，故必须在 models/services 之上）
+    core        应用骨架：应用工厂、蓝图扫描、ORM 初始化、异常、日志、路由级守卫
     controller  路由
     cli         命令行工具
 
-历史教训：`config` / `paths` 原先在 `core/` 里，导致 `lib` 与 `services`
+历史教训一：`config` / `paths` 原先在 `core/` 里，导致 `lib` 与 `services`
 反向依赖 `core`，而 `core` 又依赖 `lib.token` —— 构成 `core ⇄ lib` 的包级循环。
 把这两个叶子模块提到顶层即解环。同理 `init_permission` 因要写库而从 `lib` 移入 `services`。
+
+历史教训二（中间件拆包）：鉴权中间件从 `core/middleware.py` 拆进 `middleware/` 后，
+它必须排在 `models` / `services` **之上**（要查库），而 `core.app` 要装配 CORS、
+`core.guards` 要复用 `DEFAULT_CLAIMS`，于是 `core` 只能排在 `middleware` **之上**。
+两条约束联立，`core.i18n` 就不能再留在 core 里（中间件全都要用它）——按 `config`
+的先例提到顶层做叶子。`get_client_ip` 同理从 `core.guards` 下沉进 `lib`：
+中间件与路由装饰器都要用，只能沉到两者共同的下游。
 """
 
 import ast
@@ -29,11 +37,12 @@ import pathlib
 LAYER_ORDER = [
     "paths",
     "config",
+    "i18n",
     "lib",
     "models",
     "services",
-    "core",
     "middleware",
+    "core",
     "controller",
     "cli",
 ]
@@ -112,8 +121,23 @@ def test_lib_stays_free_of_orm():
     assert not offenders, f"lib 不得依赖 models: {offenders}"
 
 
-def test_config_and_paths_are_leaves():
-    """配置与路径必须保持叶子地位：只能依赖彼此，不能反向依赖任何业务层。"""
-    for name, allowed in (("paths", set()), ("config", {"paths"})):
+def test_leaf_modules_stay_leaves():
+    """顶层叶子模块只能依赖更底层的叶子，不能反向依赖任何业务层。
+
+    ``i18n`` 在这里的意义尤其大：全框架（含 middleware / core / controller）都要用它，
+    它一旦回头 import 任何上层，环立刻回来。
+    """
+    for name, allowed in (("paths", set()), ("config", {"paths"}), ("i18n", set())):
         deps = {dst for dst, _ in _collect_edges().get(name, set())}
         assert deps <= allowed, f"webx/{name}.py 依赖了 {deps - allowed}，它必须保持叶子"
+
+
+def test_core_no_longer_owns_middleware():
+    """中间件已拆成独立包——``core/middleware.py`` 不得复活。
+
+    这是本次结构改造要守住的东西：加一条中间件永远只该动 ``webx/middleware/``
+    或业务自己的 ``app/middlewares/``，绝不该回到「改 core 文件」。
+    """
+    assert not (WEBX_ROOT / "core" / "middleware.py").exists(), (
+        "core/middleware.py 又出现了：中间件应放在 webx/middleware/，一个中间件一个模块"
+    )

@@ -30,7 +30,7 @@ from webx.models import VerifyCodeBizType, VerifyCodeChannel
 from webx.lib.senders import get_sender
 from webx.services.user_service import user_service
 from webx.services.verifycode_service import vc_status, verifycode_service
-from webx.core.i18n import get_lang_from_header, t
+from webx.i18n import get_lang_from_header, t
 from webx.lib.regex_rules import EMAIL_RE, MOBILE_RE
 
 

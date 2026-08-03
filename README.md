@@ -12,7 +12,7 @@
 | 加密令牌 | `webx.lib.token` | AES-256-GCM，libcrypto 优先 + 纯 Python 兜底，零第三方依赖 |
 | ORM 表结构同步 | `webx.lib.schema_sync` | 模型即权威，对比 information_schema 生成最小 DDL |
 | 自动蓝图路由 | `webx.core.auto_blueprint` | 递归扫描 controller 包，自动发现并注册蓝图 |
-| 层级中间件 | `webx.core.middleware` + `webx.middleware/` | `__mid__.py` 目录继承 + 模块级追加 |
+| 层级中间件 | `webx.middleware/` | 一个中间件一个模块；`__mid__.py` 目录继承 + 模块级追加 |
 
 **内置路由（`webx/controller/`）** —— 装了就有全套端点，不用一个项目写一遍
 
@@ -32,23 +32,39 @@
 **1. 中间件不再焊死在 core**
 
 原项目的痛点是"加中间件要改 `core/middleware.py`"。这里的解法是**拆目录 + 分层**，
-不是加抽象层：
+不是加抽象层——`core/middleware.py` 这个文件**已经不存在了**：
 
-- `webx/core/middleware.py` —— **核心层保留**，做认证与角色闸门（不需要查库的那部分）。
-- `webx/middleware/` —— **独立的可插拔目录**，一个中间件一个文件（`client_ip` / `lang` / `request_id`）。
-- 需要查库的中间件（如 RBAC 权限加载）也在 `core/middleware.py`。
-  **中间件直接 import models / services 是正常的**，那是框架内部的分层依赖，
-  不必为此套一层依赖注入。
+| 模块 | 内容 |
+|---|---|
+| `middleware/auth.py` | 阶段 1 认证：`auth_middleware`、`make_auth_middleware`、`make_role_middleware` |
+| `middleware/admin.py` | 管理端认证（`role == admin`），就是工厂的一次带参调用 |
+| `middleware/perm.py` | 阶段 2/3 RBAC：`role_perm_middleware`、`@require_permission`、`has_perm` |
+| `middleware/cors.py` | CORS 预检与响应头（应用级装配） |
+| `middleware/{client_ip,lang,request_id}.py` | 通用件，一件一文件 |
+
+- **一个中间件一个模块**，唯一的例外是 `perm.py`：写 `ctx.permissions` 的中间件与读它的
+  装饰器共用同一份数据契约，拆开只会变成互相 import。
+- **中间件直接 import models / services 是正常的**，那是框架内部的分层依赖，
+  不必为此套一层依赖注入。正因为它要查库，`middleware/` 在分层里排在 `models`/`services`
+  **之上**、`core` **之下**——搬出去之后 `core` 不再依赖任何业务模型。
 - 业务项目建自己的 `app/middlewares/`，结构完全相同，通过 `__mid__.py` 挂载。
 
 **加中间件永远不需要改框架文件。**
 
-**2. 路径不再靠 `__file__` 上溯，配置也不在 core 里**
+`__mid__.py` **加载失败不会静默降级**：文件不存在 = 该目录不追加中间件（合法配置）；
+文件存在但导入/求值失败 = 配置意图未知，抛 `MiddlewareConfigError` → 该目录**及其所有
+子目录**一律不注册路由（对外 404 不可达），并记一条 ERROR。理由是鉴权配置的失败方式
+只能是「不放行」，不能是「当作没配」——否则 `__mid__.py` 里一个笔误就让整组接口裸奔。
+根 `__mid__.py`（`create_app` 每次扫描的那个包自己那份）失败则直接抛：它决定所有组的
+基础链，失败即零路由空服务，还会骗过健康检查。
+
+**2. 路径不再靠 `__file__` 上溯，配置与文案也不在 core 里**
 
 webx 是独立安装的包，`Path(__file__).parent.parent` 只会溯到 site-packages。
 项目根统一由 `webx.paths` 裁定：`configure_root()` → `WEBX_ROOT` 环境变量 → `CWD`。
 controller 目录由 `importlib.util.find_spec(包名)` 反查，包与目录永远一致。
-`paths` 与 `config` 提到顶层，解掉了 `core ⇄ lib` 的包级循环（见上方结构说明）。
+`paths` / `config` / `i18n` 三个叶子模块提到顶层，解掉了 `core ⇄ lib` 的包级循环，
+也让 `middleware/` 能排在 `core` 之下（见上方结构说明）。
 
 **3. 配置与异常不再写死在框架里**
 
@@ -104,20 +120,26 @@ myproject/
 webx/
 ├── paths.py       项目根定位，零依赖
 ├── config.py      BaseSettings，只依赖 paths + environs
-├── lib/           令牌、密码哈希、表结构同步、权限注册表、发送通道、短信（零 ORM）
+├── i18n.py        文案注册表，零依赖（全框架共用，故必须是叶子）
+├── lib/           令牌、密码哈希、表结构同步、权限注册表、发送通道、短信、存储（零 ORM）
 ├── models/        user / admin / verify_code / rbac / dtos
-├── services/      user / admin / verifycode / permission / init_permission
-├── core/          蓝图扫描、中间件、应用工厂、ORM 初始化、异常、i18n、日志
-├── middleware/    可插拔中间件，一件一文件
+├── services/      user / admin / verifycode / permission / init_permission / storage
+├── middleware/    可插拔中间件，一件一文件（认证 / RBAC / CORS / 通用件）
+├── core/          应用工厂、蓝图扫描、ORM 初始化、异常、日志、路由级守卫
 ├── controller/    内置路由，与业务项目同一套 __mid__.py 机制
 │   ├── auth/      公开
 │   ├── api/       需登录
-│   └── admin/     需管理员 + 权限加载
+│   ├── admin/     需管理员 + 权限加载
+│   └── public/    签名下载
 ```
 
-`config` 与 `paths` **不在 core 里**：它们是被所有层使用的叶子模块，放进 core 会让
-`lib` / `services` 反向依赖 `core`，而 `core` 又依赖 `lib.token`——构成
-`core ⇄ lib` 的包级循环。同理 `init_permission` 因要写库而属于 `services` 而非 `lib`。
+`config` / `paths` / `i18n` **不在 core 里**：它们是被所有层使用的叶子模块，放进 core 会让
+`lib` / `services` / `middleware` 反向依赖 `core`，而 `core` 又依赖 `lib.token`——构成
+`core ⇄ lib` 的包级循环。同理 `init_permission` 因要写库而属于 `services` 而非 `lib`，
+`get_client_ip` 因中间件与路由装饰器都要用而沉在 `lib` 而非 `core.guards`。
+
+`middleware` 排在 `core` **之下**：鉴权中间件要查库（依赖 `models`/`services`），
+而 `core.app` 要装配 CORS、`core.guards` 要复用 `DEFAULT_CLAIMS`，两条约束联立只有这一个解。
 
 这条分层约束由 `tests/test_layering.py` 用 AST 扫描全部 import 焊死，
 一次随手的反向 import 就会让测试失败。
@@ -145,7 +167,7 @@ from webx.core.app import create_app
 app = create_app("app.controller")
 
 # app/controller/api/__mid__.py
-from webx.core.middleware import auth_middleware
+from webx.middleware import auth_middleware
 MIDDLEWARES = [auth_middleware]
 ```
 
@@ -164,8 +186,8 @@ webx 内置的 `controller/` 用的是**同一套规则**，没有任何特殊�
 角色闸门与内部接口隐藏：
 
 ```python
-from webx.core.middleware import auth_middleware, admin_auth_middleware
-from webx.core.middleware import make_auth_middleware, make_role_middleware
+from webx.middleware import auth_middleware, admin_auth_middleware
+from webx.middleware import make_auth_middleware, make_role_middleware
 
 MIDDLEWARES = [auth_middleware]                             # 普通用户
 MIDDLEWARES = [admin_auth_middleware]                       # 管理端（role == admin）

@@ -20,7 +20,7 @@ from webx.models.dtos import (
 from webx.models import Admin
 from webx.lib.roles import ROLES, default_role
 from webx.services.admin_service import admin_service
-from webx.core.middleware import has_perm, is_privileged
+from webx.middleware import has_perm, is_privileged
 from webx.models import UserOrg, UserRole
 from webx.lib.funcs import now_ms
 from webx.lib.genid import gen_id

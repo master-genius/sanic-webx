@@ -8,7 +8,7 @@ import types
 
 import pytest
 
-from webx.core.middleware import ORG_HEADER, is_privileged, role_perm_middleware
+from webx.middleware import ORG_HEADER, is_privileged, role_perm_middleware
 from webx.services.init_permission import init_permissions
 from webx.lib.permissions import clear, register_module, register_permissions
 from webx.models.rbac import (

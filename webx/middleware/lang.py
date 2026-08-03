@@ -6,7 +6,7 @@
 
 from sanic import Request
 
-from webx.core.i18n import get_lang_from_header
+from webx.i18n import get_lang_from_header
 
 
 async def lang(request: Request) -> None:

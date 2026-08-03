@@ -5,7 +5,7 @@ from sanic.request import Request
 from sanic.response import json
 from sanic_ext import validate
 
-from webx.core.middleware import has_perm, is_privileged
+from webx.middleware import has_perm, is_privileged
 from webx.models import Admin
 from webx.models.dtos import PermissionGrantRequest
 from webx.models.rbac import UserPermission

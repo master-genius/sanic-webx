@@ -352,7 +352,7 @@ if __name__ == '__main__':
     print("Refreshed:", new_token)
 
 
-# ── 全局实例（供 core.middleware / core.guards 使用）────────────────
+# ── 全局实例（供 webx.middleware / core.guards 使用）────────────────
 
 # 配置缺失时的兜底密钥。生产环境必须通过 TOKEN_SECRET 覆盖。
 _FALLBACK_SECRET = 'default-secret-key-change-me-in-production'

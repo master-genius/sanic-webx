@@ -13,7 +13,7 @@ from sanic import Blueprint
 from sanic.request import Request
 from sanic.response import json
 
-from webx.core.i18n import get_lang_from_header, t
+from webx.i18n import get_lang_from_header, t
 from webx.services.storage_service import storage_service
 
 public_file_bp = Blueprint("public_file", url_prefix="/public/files")

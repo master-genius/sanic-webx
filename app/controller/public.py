@@ -8,7 +8,7 @@ from sanic import Blueprint
 from sanic.response import json
 
 from webx.config import settings
-from webx.core.i18n import t
+from webx.i18n import t
 
 bp = Blueprint("public", url_prefix="/public")
 

@@ -6,7 +6,7 @@ from sanic.response import json
 from sanic_ext import validate
 from tortoise.transactions import in_transaction
 
-from webx.core.middleware import SUPER_ROLE, has_perm
+from webx.middleware import SUPER_ROLE, has_perm
 from webx.lib.funcs import now_ms
 from webx.lib.genid import gen_id
 from webx.lib.roles import ROLES

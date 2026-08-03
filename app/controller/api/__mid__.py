@@ -4,6 +4,6 @@
 （父级继承 + 本目录追加，由 auto_blueprint 去重保序）。
 """
 
-from webx.core.middleware import auth_middleware
+from webx.middleware import auth_middleware
 
 MIDDLEWARES = [auth_middleware]

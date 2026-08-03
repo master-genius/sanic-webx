@@ -24,7 +24,7 @@ from webx.services.admin_service import admin_service
 from webx.services.user_service import user_service
 from webx.services.verifycode_service import vc_status, verifycode_service
 from webx.core.guards import require_token, with_client_ip
-from webx.core.i18n import get_lang_from_header, t
+from webx.i18n import get_lang_from_header, t
 from webx.lib.funcs import mask_email, mask_mobile
 from webx.lib.regex_rules import EMAIL_RE, MOBILE_RE
 from webx.lib.token import get_token
