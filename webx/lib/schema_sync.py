@@ -5,11 +5,17 @@ Design philosophy: 模型定义即权威,information_schema 为真相,差异最�
 手动执行一次完成同步,不做运行时锁保护。
 
 Index naming (deterministic, no randomness):
-    {table}_{sorted_cols}_idx     regular index
-    {table}_{sorted_cols}_uidx    unique index
+    {table}_{cols_in_order}_idx     regular index
+    {table}_{cols_in_order}_uidx    unique index
 
-Only indexes with these suffixes are "managed" — externally created indexes
-are never touched (unless force=True).
+列顺序**按模型声明的原样**参与命名，不排序——列顺序是复合索引语义的一部分，
+排序会让 (a,b) 与 (b,a) 撞名并静默丢掉一条（详见 _make_index_name）。
+
+两种同步强度：
+    普通模式  只管理 _idx / _uidx 后缀的索引，外部索引一概不碰。
+    force     **硬同步**：模型定义即全部真相，凡不在模型定义中的索引一律清除
+              （其它工具遗留的野索引、手工建的临时索引、旧命名规则的历史索引）。
+              唯二豁免是主键与 pg_ 开头的系统索引。
 
 Constraint vs Index distinction:
     PostgreSQL UNIQUE constraints (created by generate_schema) are backed
@@ -25,8 +31,7 @@ Usage:
     await Tortoise.init(config=TORTOISE_ORM)
     await SchemaSync.sync(debug=True)
 
-    # 清理遗留 _key 约束（如从旧迁移工具过渡）
-    await SchemaSync.migrate_from_aerich(debug=True)
+    # 硬同步：清掉一切不在模型定义中的索引（含其它工具遗留的野索引与旧命名）
     await SchemaSync.sync(force=True, debug=True)
 """
 
@@ -35,7 +40,7 @@ from __future__ import annotations
 import logging
 import re
 from enum import Enum
-from typing import Any
+from typing import Any, NamedTuple
 
 from tortoise import Tortoise
 from tortoise.fields.data import CharEnumFieldInstance
@@ -75,14 +80,110 @@ TYPES_WITH_BRACKETS = {"character varying", "character", "numeric"}
 _IDX  = "_idx"
 _UIDX = "_uidx"
 
+#: 主键索引的 PostgreSQL 默认命名后缀。与 pg_constraint 的 contype='p' 一起构成
+#: **双重保护**：任一命中即视为主键、永不删除（见 _sync_indexes 的 protected）。
+_PKEY = "_pkey"
+
+#: PostgreSQL 标识符上限（NAMEDATALEN-1），单位是**字节**不是字符。
+#: 超长不报错、**静默截断**——那会让 pg_indexes 回读的名字与 desired 的 key
+#: 永远对不上，每次同步都重复 CREATE 并报 already exists。故超长直接拒绝。
+_MAX_IDENTIFIER_BYTES = 63
+
 
 # ---------------------------------------------------------------------------
 # Naming helpers
 # ---------------------------------------------------------------------------
 
+class IndexSpec(NamedTuple):
+    """一条索引的**完整**意图。
+
+    存在的理由：四个信息源里只有 ``Meta.indexes`` 能携带列以外的信息
+    （索引方法、部分索引条件、表达式、自定义名）。早期版本把它们统一压成
+    ``(cols, unique)`` 二元组去做去重，于是 ``GinIndex(fields=("files_json",))``
+    被**静默降级**成普通 btree 索引——不报错、不告警，``\\d`` 里看着还在，
+    只有 EXPLAIN 才会暴露它服务不了 JSONB 的 ``@>`` 查询。本结构负责把信息
+    完整带到 DDL 生成处。
+
+    字段：
+        cols:       列名元组；表达式索引里是 ``"(表达式SQL)"``（自带括号）
+        unique:     是否唯一索引
+        index_type: 索引方法，``""`` = btree（PG 默认）；GIN / BRIN / GIST / …
+        extra:      尾部子句，如 ``" WHERE is_active = true"``（含前导空格）
+        name:       自定义索引名；空则按 ``_make_index_name`` 的规则派生
+    """
+
+    cols: tuple[str, ...]
+    unique: bool = False
+    index_type: str = ""
+    extra: str = ""
+    name: str = ""
+
+    @property
+    def dedup_key(self) -> tuple[tuple[str, ...], str, str]:
+        """去重键 = 列 + 方法 + 条件。
+
+        **不含 unique**：同一列集合的 unique 与 regular 是需要相互覆盖的冲突
+        （见 _add）。**含 index_type / extra**：同一列上的 btree 与 GIN 是两条
+        各自有用的索引，同列不同条件的部分索引亦然，它们不该互相顶掉。
+        """
+        return (self.cols, self.index_type, self.extra)
+
+
+def _is_plain_column(col: str) -> bool:
+    """该项是否为可安全嵌进索引名的裸列名（而非表达式）。"""
+    return col.replace("_", "").isalnum()
+
+
 def _make_index_name(table: str, cols: tuple[str, ...], unique: bool) -> str:
-    """Deterministic name: {table}_{sorted_cols}_{_idx|_uidx}"""
-    return f"{table}_{'_'.join(sorted(cols))}{'_uidx' if unique else '_idx'}"
+    """Deterministic name: {table}_{cols_in_order}_{_idx|_uidx}
+
+    ⚠️ **刻意不排序**。列顺序是复合索引语义的一部分（最左前缀原则）：
+    ``(user_id, created_at)`` 服务「按用户过滤再按时间排序」，
+    ``(created_at, user_id)`` 服务「按时间范围扫描」，二者不可互相替代、
+    同时声明是合理需求。若按排序后的列名生成名字，这两条会撞成同一个名字，
+    在 desired 字典里后者覆盖前者、**静默丢掉一条且不产生任何告警**。
+
+    附带效果：名字里的列顺序 == CREATE INDEX 的列顺序，
+    从 ``\\d table`` 看到的索引名可以直接反推它能服务哪些查询。
+    """
+    return f"{table}_{'_'.join(cols)}{'_uidx' if unique else '_idx'}"
+
+
+def _resolve_index_name(table: str, spec: IndexSpec) -> str | None:
+    """定出 spec 的最终索引名；无法确定性命名时返回 ``None``（调用方跳过并告警）。
+
+    优先用显式 ``name``。否则按 ``{table}_{cols}[_{type}]_{idx|uidx}`` 派生，
+    索引方法进名字是必须的——否则同一列上的 btree 与 GIN 会撞名。
+
+    **两种情况强制要求显式 name**，因为它们无法确定性地映射成一个稳定的标识符：
+
+      - 表达式索引：``"(LOWER(email))"`` 这类串带括号与运算符，塞进索引名既非法
+        又不可逆；
+      - 部分索引（``extra`` 非空）：条件是任意 SQL 片段，哈希进名字会让人看不懂，
+        原样拼接则非法。
+
+    宁可要求显式命名，也不生成一个「看起来能用、实际对不上」的名字——本模块判定
+    索引存在与否**只比名字**（见 _sync_indexes），名字一旦不确定，DROP/CREATE 的
+    判定就全乱了。
+    """
+    if spec.name:
+        name = spec.name
+    elif spec.extra or not all(_is_plain_column(c) for c in spec.cols):
+        return None
+    else:
+        type_seg = f"_{spec.index_type.lower()}" if spec.index_type else ""
+        suffix = _UIDX if spec.unique else _IDX
+        name = f"{table}_{'_'.join(spec.cols)}{type_seg}{suffix}"
+
+    # ── 名字本身的两条硬约束 ──────────────────────────────────────────
+    # ① 不得含双引号：DDL 里索引名用 "…" 引用，名字内再出现 " 会截断引用
+    #    （PostgreSQL 的转义写法是 ""，本模块不做转义——索引名带引号本就不该出现，
+    #     拒绝比默默转义更容易发现问题）。
+    # ② 不得超 63 字节：超长 PostgreSQL 静默截断，回读名字与 desired 的 key 对不上，
+    #    每次同步都重复 CREATE。长表名 + 多列复合索引真的会撞到这条线。
+    if '"' in name or len(name.encode("utf-8")) > _MAX_IDENTIFIER_BYTES:
+        return None
+    return name
 
 
 def _is_managed(name: str) -> bool:
@@ -132,11 +233,22 @@ def _field_to_pg(field) -> tuple[str, Any, bool, bool]:
     # field.default 未设置时值为 None，与 default=None 无法区分，
     # 但本项目模型不使用 default=None（nullable 列用 null=True 代替），
     # 因此 field.default is not None 可安全替代 has_default。
-    has_default = field.default is not None
     raw_default = getattr(field, "default", None)
 
+    # ── 可调用的 default 视同「未设置」──────────────────────────────────
+    # gen_id / list / dict 这类由 ORM 在**每次插入时**求值，库层没有等价物。
+    # 若当作普通值交给 _fmt，会得到 DEFAULT '<function gen_id at 0x7f1f30c89080>'：
+    #   ① 任何绕过 ORM 的写入（INSERT 不带该列 / COPY 导入）都会拿到这个字符串；
+    #   ② 0x7f1f… 是内存地址，进程重启就变 → 每次同步都判定 default 变了、
+    #      反复 SET DEFAULT，且每次写进去的值都不同。
+    # 排除后落入下面的类型推断分支（NOT NULL 列仍能拿到合理的填充值）。
+    # 当前项目的 callable default 全在主键上（主键在建表与列同步两条路径上均被
+    # 跳过），本判断不产生任何 DDL 差异；它防的是 JSONField(default=dict) 这类
+    # **官方推荐写法**被用在非主键列上。
+    has_default = raw_default is not None and not callable(raw_default)
+
     if has_default:
-        # 用户显式设置了 default
+        # 用户显式设置了标量 default
         if isinstance(raw_default, Enum):
             default: Any = raw_default.value
         else:
@@ -163,9 +275,9 @@ def _field_to_pg(field) -> tuple[str, Any, bool, bool]:
 # Index collection
 # ---------------------------------------------------------------------------
 
-def _collect_indexes(model_cls) -> list[tuple[tuple[str, ...], bool]]:
+def _collect_indexes(model_cls) -> list[IndexSpec]:
     """
-    Gather all index intent from a model into [(cols_tuple, is_unique)].
+    Gather all index intent from a model into [IndexSpec].
 
     Sources:
       1. Meta.indexes         (tuple or Index object) -> regular
@@ -173,9 +285,14 @@ def _collect_indexes(model_cls) -> list[tuple[tuple[str, ...], bool]]:
       3. field(index=True)                            -> regular single-col
       4. field(unique=True)                           -> unique single-col
 
+    只有 Source 1 的 Index 对象能携带列以外的信息（索引方法 / 部分索引条件 /
+    表达式 / 自定义名），这些经 IndexSpec 完整带到 DDL 生成处；其余三个来源
+    产出的都是最朴素的 btree 裸列索引。
+
     过滤规则：
       - 包含主键列的索引条目直接忽略（主键已自带索引）。
-      - 同一列集合：unique 优先，regular 被 unique 覆盖时发出警告。
+      - 同一 (列, 方法, 条件)：unique 优先，regular 被 unique 覆盖时发出警告。
+        —— 同列的 btree 与 GIN **不算冲突**，二者各自有用（见 IndexSpec.dedup_key）。
 
     注意：Meta.indexes / unique_together 中的字段名均为属性名，
     需通过 fields_db_projection 转换为 db 列名。
@@ -183,7 +300,7 @@ def _collect_indexes(model_cls) -> list[tuple[tuple[str, ...], bool]]:
     """
     meta   = model_cls._meta
     pk_col = meta.db_pk_column
-    seen: dict[tuple[str, ...], bool] = {}   # db_cols -> is_unique
+    seen: dict[tuple[tuple[str, ...], str, str], IndexSpec] = {}
 
     # 属性名 -> db 列名的完整映射（含 FK source_field 情况）
     attr_to_db: dict[str, str] = dict(meta.fields_db_projection)
@@ -208,68 +325,75 @@ def _collect_indexes(model_cls) -> list[tuple[tuple[str, ...], bool]]:
             db_cols.append(db_col)
         return tuple(db_cols)
 
-    def _add(cols: tuple[str, ...], unique: bool, source: str) -> None:
-        if not cols:
+    def _add(spec: IndexSpec, source: str) -> None:
+        if not spec.cols:
             return
 
-        # 兜底：Meta.indexes / unique_together 中手动包含主键列时拦截并警告
-        if any(c == pk_col for c in cols):
+        # ── 过滤含主键列的条目（主键已自带索引）────────────────────
+        if any(c == pk_col for c in spec.cols):
             logger.warning(
                 "[%s] %s 包含主键列 %r，主键已自带索引，忽略该条目（cols=%s）",
-                model_cls.__name__, source, pk_col, cols,
+                model_cls.__name__, source, pk_col, spec.cols,
             )
             return
 
-        # ── 过滤含主键列的条目 ──────────────────────────────────────
-        if any(c == pk_col for c in cols):
-            logger.warning(
-                "[%s] %s 包含主键列 %r，主键已自带索引，忽略该条目（cols=%s）",
-                model_cls.__name__, source, pk_col, cols,
-            )
-            return
-
-        # ── unique 与 regular 冲突检测 ──────────────────────────────
-        existing = seen.get(cols)
+        # ── unique 与 regular 冲突检测（同 列+方法+条件 才算冲突）──
+        key = spec.dedup_key
+        existing = seen.get(key)
         if existing is not None:
-            if existing and not unique:
+            if existing.unique and not spec.unique:
                 # 已登记为 unique，现在又来一个 regular —— 忽略 regular
                 logger.warning(
                     "[%s] %s cols=%s 已登记为 UNIQUE 索引，"
                     "重复的普通索引请求被忽略",
-                    model_cls.__name__, source, cols,
+                    model_cls.__name__, source, spec.cols,
                 )
                 return
-            if not existing and unique:
+            if not existing.unique and spec.unique:
                 # 已登记为 regular，现在升级为 unique —— 升级并警告
                 logger.warning(
                     "[%s] %s cols=%s 已登记为普通索引，"
                     "发现更强的 UNIQUE 约束，升级为 UNIQUE 索引",
-                    model_cls.__name__, source, cols,
+                    model_cls.__name__, source, spec.cols,
                 )
-                seen[cols] = True
+                seen[key] = existing._replace(unique=True)
                 return
             # 完全重复（same uniqueness），静默忽略
             return
 
-        seen[cols] = unique
+        seen[key] = spec
 
-    # Source 1: Meta.indexes
+    # Source 1: Meta.indexes —— 唯一能携带方法 / 条件 / 表达式 / 自定义名的来源
     for entry in (getattr(meta, "indexes", None) or []):
         if isinstance(entry, TortoiseIndex):
-            db_cols = _resolve_cols(tuple(entry.fields), "Meta.indexes")
+            # fields 走属性名→列名转换；expressions 已是 "(SQL)" 串，原样带过去。
+            # 二者在 Tortoise 里互斥（Index.__init__ 强制），故这里非此即彼。
+            if entry.fields:
+                db_cols = _resolve_cols(tuple(entry.fields), "Meta.indexes")
+            else:
+                db_cols = tuple(entry.field_names)
             if db_cols is not None:
-                _add(db_cols, False, "Meta.indexes")
+                _add(
+                    IndexSpec(
+                        cols=db_cols,
+                        unique=False,
+                        index_type=getattr(type(entry), "INDEX_TYPE", "") or "",
+                        extra=getattr(entry, "extra", "") or "",
+                        name=getattr(entry, "name", "") or "",
+                    ),
+                    "Meta.indexes",
+                )
         elif isinstance(entry, (tuple, list)):
             db_cols = _resolve_cols(tuple(entry), "Meta.indexes")
             if db_cols is not None:
-                _add(db_cols, False, "Meta.indexes")
+                _add(IndexSpec(cols=db_cols), "Meta.indexes")
 
     # Source 2: Meta.unique_together
     for entry in (getattr(meta, "unique_together", None) or []):
         if isinstance(entry, (tuple, list)):
             db_cols = _resolve_cols(tuple(entry), "Meta.unique_together")
             if db_cols is not None:
-                _add(db_cols, True, "Meta.unique_together")
+                _add(IndexSpec(cols=db_cols, unique=True), "Meta.unique_together")
 
     # Sources 3 & 4: field-level flags
     # fields_db_projection 直接给出 db 列名，无需转换
@@ -289,12 +413,15 @@ def _collect_indexes(model_cls) -> list[tuple[tuple[str, ...], bool]]:
             or getattr(field_obj, "index", False)
         )
         if is_indexed:
-            _add((db_col,), False, f"field({field_attr}, index=True)")
+            _add(IndexSpec(cols=(db_col,)), f"field({field_attr}, index=True)")
 
         if getattr(field_obj, "unique", False):
-            _add((db_col,), True, f"field({field_attr}, unique=True)")
+            _add(
+                IndexSpec(cols=(db_col,), unique=True),
+                f"field({field_attr}, unique=True)",
+            )
 
-    return list(seen.items())
+    return list(seen.values())
 
 
 # ---------------------------------------------------------------------------
@@ -320,29 +447,39 @@ def _warn_fk(model_cls, debug: bool) -> None:
 # Constraint index introspection helper
 # ---------------------------------------------------------------------------
 
-async def _fetch_constraint_indexes(conn, schema: str, table: str) -> set[str]:
-    """
-    查询 pg_constraint，返回由 UNIQUE / EXCLUDE 约束支撑的索引名集合。
+async def _fetch_constraint_indexes(conn, schema: str, table: str) -> dict[str, str]:
+    """查询由约束支撑的索引，返回 ``{名字: contype}``。
 
-    这类索引在 pg_indexes 中可见，但不能用 DROP INDEX 删除，
-    必须用 ALTER TABLE ... DROP CONSTRAINT。
+    约束支撑的索引在 ``pg_indexes`` 中可见，但**不能用 DROP INDEX 删除**，
+    必须走 ``ALTER TABLE ... DROP CONSTRAINT``。三类的处置不同：
 
-    注意：
-    - PRIMARY KEY 约束已在调用方通过 indexname != '{table}_pkey' 过滤，
-      此处仍用 contype IN ('u', 'x') 做精确过滤，避免 PK 被误操作。
-    - conindid > 0 确保只返回真正有支撑索引的约束行。
+      - ``p`` PRIMARY KEY —— **永不删除**，返回它只为让调用方识别并跳过
+      - ``u`` UNIQUE / ``x`` EXCLUDE —— 不在模型定义中时用 DROP CONSTRAINT 清理
+
+    **约束名即索引名**，这是 PostgreSQL 的保证而非巧合，故 conname 可直接当索引名用，
+    无需再 JOIN pg_class 按 conindid 反查。依据（ALTER TABLE 文档，ADD
+    table_constraint USING INDEX 一节）：
+
+        "If a constraint name is provided then the index will be renamed to match
+         the constraint name. Otherwise the constraint will be named the same as
+         the index."
+
+    即便拿一个既有索引去提升为约束，PostgreSQL 也会把索引重命名成约束名，
+    二者不存在长期不一致的状态。
+
+    ``conindid > 0`` 确保只返回真正有支撑索引的约束行（CHECK 等没有）。
     """
     _, rows = await conn.execute_query(
         """
-        SELECT conname
+        SELECT conname, contype
         FROM   pg_constraint
         WHERE  conrelid = ($1 || '.' || $2)::regclass
-          AND  contype  IN ('u', 'x')
+          AND  contype  IN ('p', 'u', 'x')
           AND  conindid  > 0
         """,
         [schema, table],
     )
-    return {r["conname"] for r in rows}
+    return {r["conname"]: r["contype"] for r in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +494,7 @@ class SchemaSync:
         await Tortoise.init(config=TORTOISE_ORM)
         await SchemaSync.sync(debug=True)
 
-    清理遗留约束:
-        await SchemaSync.migrate_from_aerich(debug=True)
+    硬同步（清掉一切不在模型定义中的索引）:
         await SchemaSync.sync(force=True, debug=True)
     """
 
@@ -382,11 +518,15 @@ class SchemaSync:
             debug:              True 时日志输出每条 DDL 语句。
             only:               可选的模型类名列表，限制只同步这些模型。
                                 None（默认）同步全部。
-            force:              强制模式：
-                                  - 类型不兼容时 DROP+ADD 重建列；
-                                  - 清理所有不在模型定义中的非系统索引
-                                    （包括遗留的 _key 约束，
-                                     普通模式只管理 _idx/_uidx 后缀的索引）。
+            force:              **硬同步**（模型定义即全部真相）：
+                                  - 类型不兼容时 DROP+ADD 重建列（⚠️ 该列数据丢失）；
+                                  - 清理所有不在模型定义中的索引，不看命名规则——
+                                    含其它工具遗留的野索引、手工建的临时索引、
+                                    旧命名规则的历史索引、以及由 UNIQUE/EXCLUDE
+                                    约束支撑的索引（走 DROP CONSTRAINT）。
+                                    唯二豁免：主键与 pg_ 开头的系统索引。
+                                  ⚠️ 手工创建的特殊索引（如 JSONB 的 GIN 索引）
+                                     无法在模型中声明，本模式下会被删除。
         """
         conn    = Tortoise.get_connection("default")
         db_name = await cls._db_name(conn)
@@ -416,64 +556,6 @@ class SchemaSync:
         """创建 schema（如果不存在）。"""
         conn = Tortoise.get_connection("default")
         await conn.execute_script(f"CREATE SCHEMA IF NOT EXISTS {schema};")
-
-    @classmethod
-    async def migrate_from_aerich(
-        cls,
-        *,
-        schema: str = "public",
-        debug: bool = False,
-    ) -> None:
-        """
-        清理遗留的 UNIQUE 约束（PostgreSQL 自动命名为 _key 后缀）。
-
-        generate_schema 使用 ALTER TABLE ... ADD CONSTRAINT 创建唯一约束，
-        而本工具改用 CREATE UNIQUE INDEX（_uidx 后缀）。
-        两套机制并存时会出现重复保障，且 force 模式下直接 DROP INDEX 会报错。
-
-        本方法删除所有 _key 后缀的 UNIQUE 约束，之后由 sync(force=True) 按
-        模型定义重建为 _uidx 索引。
-
-        幂等：重复调用无副作用（IF EXISTS 保护）。
-
-        典型用法:
-            await SchemaSync.migrate_from_aerich(debug=True)
-            await SchemaSync.sync(force=True, debug=True)
-        """
-        conn = Tortoise.get_connection("default")
-
-        # 查找所有 _key 后缀的 UNIQUE 约束（排除系统表）
-        _, rows = await conn.execute_query(
-            """
-            SELECT c.conname,
-                   c.conrelid::regclass AS tbl
-            FROM   pg_constraint c
-            JOIN   pg_class       r ON r.oid = c.conrelid
-            JOIN   pg_namespace   n ON n.oid = r.relnamespace
-            WHERE  c.contype    = 'u'
-              AND  c.conname   LIKE '%_key'
-              AND  n.nspname    = $1
-            ORDER  BY tbl, c.conname
-            """,
-            [schema],
-        )
-
-        if not rows:
-            if debug:
-                logger.info("[migrate_from_aerich] 未发现遗留约束，无需清理")
-            return
-
-        for r in rows:
-            sql = f'ALTER TABLE {r["tbl"]} DROP CONSTRAINT IF EXISTS "{r["conname"]}"'
-            if debug:
-                logger.info("[migrate_from_aerich] %s", sql)
-            await conn.execute_script(sql)
-
-        logger.info(
-            "[migrate_from_aerich] 已清理 %d 个遗留约束，"
-            "请执行 sync(force=True) 重建索引",
-            len(rows),
-        )
 
     # ------------------------------------------------------------------ #
     #  Per-model orchestration
@@ -726,62 +808,98 @@ class SchemaSync:
         cls, conn, model_cls, schema: str, cur: str, table: str,
         debug: bool, force: bool = False,
     ) -> None:
-        # Desired: name -> (cols, unique)
-        desired: dict[str, tuple[tuple[str, ...], bool]] = {
-            _make_index_name(table, cols, unique): (cols, unique)
-            for cols, unique in _collect_indexes(model_cls)
-        }
+        # Desired: name -> IndexSpec
+        # 不用字典推导：命名失败（表达式/部分索引未显式 name）要**告警并跳过**，
+        # 而不是悄悄少建一条——本模块判定索引存在与否只比名字，静默跳过等于骗人。
+        desired: dict[str, IndexSpec] = {}
+        for spec in _collect_indexes(model_cls):
+            iname = _resolve_index_name(table, spec)
+            if iname is None:
+                logger.warning(
+                    "[%s] 索引 cols=%s type=%r extra=%r 无法确定性命名，已跳过。"
+                    "表达式索引与部分索引请在 Index(..., name=\"…\") 中显式指定名字。",
+                    model_cls.__name__, spec.cols, spec.index_type, spec.extra,
+                )
+                continue
+            desired[iname] = spec
 
-        # ── 查询由 UNIQUE / EXCLUDE 约束支撑的索引 ───────────────────
+        # ── 约束支撑的索引：{名字: contype}（约束名即索引名，PG 保证）─────
         # 这类索引在 pg_indexes 中可见，但必须通过 DROP CONSTRAINT 删除。
         constraint_indexes = await _fetch_constraint_indexes(conn, schema, table)
 
-        # ── 查询现有索引（排除主键）──────────────────────────────────
+        # ── 查询现有索引 ──────────────────────────────────────────────
         _, rows = await conn.execute_query(
             """
             SELECT indexname, indexdef
             FROM   pg_indexes
             WHERE  tablename  = $1
               AND  schemaname = $2
-              AND  indexname  != $3
             """,
-            [table, schema, f"{table}_pkey"],
+            [table, schema],
         )
 
+        # ── 主键保护名单（任何模式下都不删）──────────────────────────
+        # **双重判定，任一命中即保护**，两条判据相互独立：
+        #   ① contype='p' —— 查 pg_constraint 得到的权威判据；
+        #   ② 名字以 _pkey 结尾 —— PostgreSQL 的默认命名，纯字符串判断，
+        #      连 pg_constraint 都不查（该表查询若因权限等原因返回空也照样兜住）。
+        # 删掉主键索引会让表直接失去主键约束，代价远高于「多留一个名字像主键的索引」，
+        # 故这里刻意取并集而非交集：宁可漏删，不可误删。
+        protected = {n for n, ctype in constraint_indexes.items() if ctype == "p"}
+        protected |= {r["indexname"] for r in rows if r["indexname"].endswith(_PKEY)}
+
         if force:
-            # force 模式：清理所有非系统索引
+            # ── 硬同步：模型定义即全部真相 ────────────────────────────
+            # 凡不在模型定义中的索引一律清除，不看命名规则——包括其它工具遗留的
+            # 「野索引」、手工建的临时索引、旧命名规则的历史索引。
+            # 唯二豁免：主键（protected，删了表就废了）与 pg_ 开头的系统索引。
+            #
+            # ⚠️ 手工创建的特殊索引（如 JSONB 的 GIN 索引）在本模式下**会被删除**。
+            #    本工具只能表达裸列 btree 索引，无法在模型里声明它们；
+            #    如有此类索引，要么别用 --force，要么先扩展本模块的索引表达能力。
             existing: dict[str, str] = {
                 r["indexname"]: r["indexdef"]
                 for r in rows
-                if not r["indexname"].startswith("pg_")
+                if not r["indexname"].startswith("pg_") and r["indexname"] not in protected
             }
         else:
-            # 普通模式：只管理本工具创建的索引（_idx / _uidx 后缀）
+            # 普通模式：只管理本工具创建的索引（_idx / _uidx 后缀），
+            # 外部索引一概不碰。主键天然不匹配这两个后缀，无需额外排除。
             existing = {
                 r["indexname"]: r["indexdef"]
                 for r in rows
-                if _is_managed(r["indexname"])
+                if _is_managed(r["indexname"]) and r["indexname"] not in protected
             }
 
         # ── DROP 已废弃的索引 ─────────────────────────────────────────
         for iname in existing:
             if iname not in desired:
                 if iname in constraint_indexes:
-                    # 约束支撑的索引：必须 DROP CONSTRAINT
+                    # 约束支撑的索引：必须 DROP CONSTRAINT（约束名即索引名）
                     sql = f'ALTER TABLE {cur} DROP CONSTRAINT IF EXISTS "{iname}"'
                 else:
-                    sql = f"DROP INDEX IF EXISTS {schema}.{iname}"
+                    sql = f'DROP INDEX IF EXISTS {schema}."{iname}"'
                 if debug:
                     logger.info(sql)
                 await conn.execute_script(sql)
 
         # ── CREATE 缺失的索引 ─────────────────────────────────────────
-        for iname, (cols, unique) in desired.items():
+        for iname, spec in desired.items():
             if iname in existing:
                 continue
-            col_list = ", ".join(f'"{c}"' for c in cols)
-            kind     = "UNIQUE INDEX" if unique else "INDEX"
-            sql      = f"CREATE {kind} {iname} ON {cur} ({col_list})"
+            # 表达式项（field_names already yields "(SQL)"）原样输出，裸列名加引号
+            col_list = ", ".join(
+                f'"{c}"' if _is_plain_column(c) else c for c in spec.cols
+            )
+            kind  = "UNIQUE INDEX" if spec.unique else "INDEX"
+            # 索引方法：**空 = 不写 USING**，由 PostgreSQL 用默认的 btree。
+            # 位置对齐 PG 语法（也是 Tortoise BasePostgresSchemaGenerator 的做法）：
+            #   CREATE [UNIQUE] INDEX 名 ON 表 [USING 方法] (列…) [WHERE …]
+            using = f"USING {spec.index_type} " if spec.index_type else ""
+            # 索引名加引号：自定义 name 可能含大写，不加引号会被 PG 折叠成小写，
+            # 于是 pg_indexes 回读的名字与 desired 的 key 永远对不上——每次同步都
+            # 重复 CREATE 并报 already exists。与 DROP 两处保持一致的引用方式。
+            sql   = f'CREATE {kind} "{iname}" ON {cur} {using}({col_list}){spec.extra}'
             if debug:
                 logger.info(sql)
             await conn.execute_script(sql)
