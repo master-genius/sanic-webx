@@ -11,11 +11,12 @@ from webx.config import BaseSettings, configure_settings, env
 
 @dataclass
 class Settings(BaseSettings):
-    # 模型模块：dbsync 与 Tortoise 的加载源。
-    # 用到 webx 自带的用户体系/权限体系，就把对应模型模块列进来。
-    MODELS_MODULES: list[str] = field(
-        default_factory=lambda: ["app.models", "webx.models"]
-    )
+    # 这里只写业务自有的配置字段。
+    #
+    # ⚠️ 模型模块**没有配置项**：按约定自动挂接——装配哪个模块就扫它的
+    # <pkg>/models，webx 自己也走同一套（挂了内置路由就带上 webx/models）。
+    # 确定的模块 + 确定的目录，扫描即知。不想要某个模块的模型就把它的
+    # models.py 改名成 _models.py 或删掉，探测不到自然不加载。
 
     # 业务自有字段示例
     WELCOME_TEXT: str = field(default_factory=lambda: env.str("WELCOME_TEXT", "hello webx"))

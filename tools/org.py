@@ -130,7 +130,13 @@ async def cmd_init_perm(args) -> None:
     """把权限注册表同步进该组织。
 
     注册表内容来自代码（``register_permissions``），所以要先 import 到业务的
-    权限声明模块——通常业务的 ``app.config`` 或 ``app.main`` 已经做了。
+    权限声明模块。CLI 这条路只会 import ``app.config``（``_bootstrap.load_settings``），
+    所以业务得保证自己的 ``register_permissions(...)`` 挂在那条 import 链上。
+
+    ⚠️ 内置 admin 组的权限定义**不在**这条链上：``register_admin_permissions()``
+    由 ``create_app`` 在服务进程里按 ``builtin_controller`` 调用，CLI 不装配应用、
+    自然不会执行它。故本命令同步的只是业务自己声明的那部分。
+    注册表为空时 ``init_permissions`` 整体跳过，不会误删库里已有的记录。
     """
     orgid = args.orgid
     if not orgid and args.org:

@@ -1,7 +1,7 @@
 """数据库初始化。
 
-配置来源是 ``settings.tortoise_config()``（模型模块列表由业务的
-``MODELS_MODULES`` 决定），框架不假设业务模型在哪。
+配置来源是 ``settings.tortoise_config()``；模型模块列表由装配的模块按约定扫出来
+（``<pkg>/models``），框架不假设业务模型在哪，也没有对应的配置项。
 """
 
 from __future__ import annotations
@@ -26,7 +26,10 @@ async def init_db(app=None) -> None:
     """
     config = settings.tortoise_config()
     if not config["apps"]["models"]["models"]:
-        logger.warning("MODELS_MODULES 为空，未加载任何模型")
+        logger.warning(
+            "未解析出任何模型模块，ORM 将没有任何表可用。"
+            "检查装配的模块里是否有 <pkg>/models（改名成 _models 就会被跳过）"
+        )
     await Tortoise.init(config=config, _enable_global_fallback=True)
     logger.info("Tortoise ORM 初始化完成 (PID=%s)", os.getpid())
 

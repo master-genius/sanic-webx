@@ -16,7 +16,7 @@ from sanic.response import json
 from webx.i18n import get_lang_from_header, t
 from webx.services.storage_service import storage_service
 
-public_file_bp = Blueprint("public_file", url_prefix="/public/files")
+public_file_bp = Blueprint("webx_public_file", url_prefix="/public/files")
 
 
 @public_file_bp.get("/<bucket:str>/<filename:str>")

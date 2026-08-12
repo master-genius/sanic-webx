@@ -29,7 +29,7 @@ from webx.services.storage_service import storage_service
 
 logger = logging.getLogger(__name__)
 
-file_bp = Blueprint("file", url_prefix="/api/files")
+file_bp = Blueprint("webx_file", url_prefix="/api/files")
 
 
 def _key(bucket: str, name: str) -> str:

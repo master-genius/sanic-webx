@@ -253,16 +253,16 @@ def test_real_assembly_has_no_skipped_group(app_with_db):
     admin_chain = ["admin_auth_middleware", "role_perm_middleware"]
     expected = {
         # 内置：webx/controller/（自身没有根 __mid__.py，故链条就是各组自己声明的那段）
-        "auth": [],  # 公开组，鉴权走路由级 @require_token
-        "user": ["auth_middleware"],
-        "file": ["auth_middleware"],
-        "account": admin_chain,
-        "auth_permission": admin_chain,
-        "permission": admin_chain,
-        "role": admin_chain,
-        "role_permission": admin_chain,
-        "user_role": admin_chain,
-        "public_file": [],  # 签名下载：授权靠限时签名本身，不需要登录
+        "webx_auth": [],  # 公开组，鉴权走路由级 @require_token
+        "webx_user": ["auth_middleware"],
+        "webx_file": ["auth_middleware"],
+        "webx_account": admin_chain,
+        "webx_auth_permission": admin_chain,
+        "webx_permission": admin_chain,
+        "webx_role": admin_chain,
+        "webx_role_permission": admin_chain,
+        "webx_user_role": admin_chain,
+        "webx_public_file": [],  # 签名下载：授权靠限时签名本身，不需要登录
         # 业务示例：app/controller/（根 __mid__.py 提供 request_id / client_ip / lang）
         "public": ["request_id", "client_ip", "lang", "access_note"],
         "note": ["request_id", "client_ip", "lang", "access_note", "auth_middleware"],

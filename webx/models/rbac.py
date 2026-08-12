@@ -1,6 +1,6 @@
 """RBAC 模型：组织 / 角色 / 权限三层关系。
 
-启用方式：把 ``"webx.models"`` 加进业务的 ``MODELS_MODULES``，
+启用方式：保持内置路由组开启（默认），本模块即自动挂接，
 再跑 ``python -m webx.cli.dbsync`` 建表。不需要 RBAC 的项目完全不受影响。
 
 权限判定优先级：**用户单独权限 > 角色权限**——``UserPermission`` 里有记录就以其

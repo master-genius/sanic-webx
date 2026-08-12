@@ -16,7 +16,7 @@ def _forbidden(msg: str = "权限不足"):
     return json({"error": msg}, status=403)
 
 
-auth_perm_bp = Blueprint("auth_permission", url_prefix="/api/admin/auth-permission")
+auth_perm_bp = Blueprint("webx_auth_permission", url_prefix="/api/admin/auth-permission")
 
 
 @auth_perm_bp.get("/")

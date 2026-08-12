@@ -12,10 +12,11 @@
       @dataclass
       class Settings(BaseSettings):
           APP_NAME: str = "myapp"
-          MODELS_MODULES: list[str] = field(default_factory=lambda: ["app.models"])
           MY_FEATURE_FLAG: bool = field(default_factory=lambda: env.bool("MY_FEATURE_FLAG", False))
 
       settings = configure_settings(Settings())
+
+  这里**只写业务自有字段**。模型模块不用声明——按约定扫 `<pkg>/models` 自动挂接。
 
 框架内部一律 `from webx.config import settings` 拿到的是**代理对象**，
 访问时才解析到业务注册的实例——保证框架代码与业务配置类零编译期耦合。
@@ -28,7 +29,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from environs import Env
 
@@ -81,9 +82,11 @@ class BaseSettings:
         default_factory=lambda: env.int("DATABASE_TRANSACTION_TIMEOUT_MS", 0)
     )
 
-    # 模型模块列表 —— schema_sync / Tortoise 的加载源。
-    # 业务项目覆写为 ["app.models"]；启用 RBAC 时追加 "webx.models"。
-    MODELS_MODULES: list[str] = field(default_factory=lambda: env.list("MODELS_MODULES", default=[]))
+    # ⚠️ 这里**没有**模型模块配置。模型跟随模块，由 `apply_module_models` 按约定
+    # 扫 `<pkg>/models` 解析，结果存在模块级的 `_RESOLVED_MODELS` 里，用
+    # `resolved_models()` 读。不想加载某个模块的模型，就把 `models.py` 改名成
+    # `_models.py` 或删掉——让"有没有"由文件系统表达，而不是由一份要跟文件系统
+    # 对账的清单表达。
 
     # ==================== 令牌 / 鉴权 ====================
     # WebxToken（AES-256-GCM）主密钥。长度 < 16 会被 fix_key 拒绝，务必配置真值。
@@ -237,7 +240,7 @@ class BaseSettings:
     def tortoise_config(self) -> dict[str, Any]:
         """按当前配置生成 Tortoise ORM 配置字典。
 
-        模型来源为 `MODELS_MODULES`——框架不假设业务模型叫什么、放在哪。
+        模型来源是 `resolved_models()`——由装配的模块按约定扫出来，没有配置项。
         """
         return {
             "connections": {
@@ -260,7 +263,7 @@ class BaseSettings:
             },
             "apps": {
                 "models": {
-                    "models": list(self.MODELS_MODULES),
+                    "models": resolved_models(),
                     "default_connection": "default",
                 }
             },
@@ -285,6 +288,59 @@ def get_settings() -> BaseSettings:
     if _settings is None:
         _settings = BaseSettings()
     return _settings
+
+
+def module_exists(name: str) -> bool:
+    """子模块是否存在。父包不存在时 ``find_spec`` 会抛，一并当作「不存在」。"""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+# 本进程解析出的模型模块列表。**不是配置项**，没有环境变量、也不需要业务声明——
+# 它是 `apply_module_models` 按约定扫出来的结果，只经由 `resolved_models()` 读取。
+_RESOLVED_MODELS: list[str] = []
+
+
+def apply_module_models(modules: Iterable[str]) -> list[str]:
+    """按约定解析出模型模块列表并记录下来，返回结果。
+
+    规则只有一条：**装配了哪个模块，就带上它的 ``<pkg>/models``**（存在才带）。
+    ``webx`` 自己也走这套——挂了内置路由组时它就是一个普通模块，没有特殊待遇。
+    不想要某个模块的模型，把 ``models.py`` 改名 ``_models.py`` 或删掉即可，
+    探测不到自然不加载。
+
+    **服务进程与 CLI 必须共用这一个函数**。``create_app`` 调它，``tools/dbsync.py``
+    这类脚本也调它——两边若各算各的，就会出现「``WEBX_MODULES=app,appx`` 启动的服务
+    路由齐全，但 dbsync 只建了 app 的表」，接口一查库就 no such table，
+    而且启动阶段毫无征兆。
+
+    语义是**完整替换**而非累加：一次调用就表达「本进程装配这些模块」的全部结论，
+    重复调用不会把上一次的残留带进来（进程内只装配一次，测试之间也因此天然隔离）。
+
+    Args:
+        modules: 模块包名，如 ``["app", "appx", "webx"]``。
+
+    Returns:
+        解析出的模型模块列表，保序去重。
+    """
+    global _RESOLVED_MODELS
+
+    out: list[str] = []
+    for m in modules:
+        name = f"{m}.models"
+        if name not in out and module_exists(name):
+            out.append(name)
+    _RESOLVED_MODELS = out
+    return list(out)
+
+
+def resolved_models() -> list[str]:
+    """本进程要交给 ORM 的模型模块列表（`apply_module_models` 的结果）。"""
+    return list(_RESOLVED_MODELS)
 
 
 class _SettingsProxy:

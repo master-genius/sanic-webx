@@ -29,7 +29,7 @@ from webx.lib.funcs import mask_email, mask_mobile
 from webx.lib.regex_rules import EMAIL_RE, MOBILE_RE
 from webx.lib.token import get_token
 
-auth_bp = Blueprint("auth", url_prefix="/auth")
+auth_bp = Blueprint("webx_auth", url_prefix="/auth")
 
 
 # ==================== 账密登录 / 注册 ====================

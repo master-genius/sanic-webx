@@ -139,9 +139,30 @@ def test_builtin_groups_can_be_selected():
     assert set(BUILTIN_GROUPS) == {"auth", "api", "admin", "public"}
 
 
-def test_unknown_builtin_group_is_rejected():
-    """写错组名要当场报错，而不是静默少挂一组路由。"""
+def test_unknown_builtin_group_is_dropped_with_warning(caplog):
+    """写错的组名剔除掉、**不中止启动**，但必须留 WARNING。
+
+    取舍是「先保证服务起得来」：内置组配错时宁可少挂/多挂几组，也不要让整个服务
+    拒绝启动。代价是配置错误不再当场暴露，故只能靠日志——没有 WARNING 的话，
+    「我以为只挂了 auth」与「实际不是这样」就永远查不出来。
+    """
     from webx.core.app import _builtin_packages
 
-    with pytest.raises(ValueError, match="未知的内置路由组"):
-        _builtin_packages(["nope"])
+    with caplog.at_level("WARNING"):
+        assert _builtin_packages(["auth", "nope"]) == ["webx.controller.auth"]
+
+    assert "nope" in caplog.text and "未知的内置路由组" in caplog.text
+
+
+def test_all_invalid_builtin_groups_fall_back_to_full_load(caplog):
+    """一个有效组都不剩 → 回退**全部加载**，而不是变成零内置路由。
+
+    零内置路由会让 ``/auth/login`` 一起消失——那比多挂几组更难排查，
+    且多半不是配置者的本意（真不要内置路由的人会显式写 false）。
+    """
+    from webx.core.app import _builtin_packages
+
+    with caplog.at_level("WARNING"):
+        assert _builtin_packages(["nope", "alsobad"]) == ["webx.controller"]
+
+    assert "全部无效" in caplog.text and "false" in caplog.text

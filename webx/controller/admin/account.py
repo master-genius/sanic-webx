@@ -40,7 +40,7 @@ def _view(admin: Admin) -> dict:
 def _forbidden(msg: str = "权限不足"):
     return json({"error": msg}, status=403)
 
-account_bp = Blueprint("account", url_prefix="/api/admin/account")
+account_bp = Blueprint("webx_account", url_prefix="/api/admin/account")
 
 
 @account_bp.get("/")

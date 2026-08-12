@@ -52,7 +52,7 @@ async def _current_user(request: Request):
         return None, json({"error": t("user_not_found", lang)}, status=404)
     return user, None
 
-user_bp = Blueprint("user", url_prefix="/api/user")
+user_bp = Blueprint("webx_user", url_prefix="/api/user")
 
 
 # ==================== 资料 ====================

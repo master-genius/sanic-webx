@@ -7,7 +7,7 @@ from sanic.response import json
 from webx.lib.roles import ROLES, role_level, role_name
 
 
-role_bp = Blueprint("role", url_prefix="/api/admin/role")
+role_bp = Blueprint("webx_role", url_prefix="/api/admin/role")
 
 
 @role_bp.get("/")

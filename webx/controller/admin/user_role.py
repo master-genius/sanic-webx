@@ -18,7 +18,7 @@ def _forbidden(msg: str = "权限不足"):
     return json({"error": msg}, status=403)
 
 
-user_role_bp = Blueprint("user_role", url_prefix="/api/admin/user-role")
+user_role_bp = Blueprint("webx_user_role", url_prefix="/api/admin/user-role")
 
 
 @user_role_bp.get("/<uid:str>")

@@ -58,6 +58,40 @@
 根 `__mid__.py`（`create_app` 每次扫描的那个包自己那份）失败则直接抛：它决定所有组的
 基础链，失败即零路由空服务，还会骗过健康检查。
 
+**全站中间件用 `create_app(global_middleware=[...])`**。中间件共四层，从外到内是
+「全站 → 包（根 `__mid__.py`）→ 目录 → 模块（`__mid__` 变量）」，全站这层跟随**部署**：
+同一份链传给每一次扫描，故**内置路由与业务路由都吃得到**——此前业务的
+`app/controller/__mid__.py` 盖不到 `/api/user` 这类内置端点，且没有任何提示。
+与包级重复声明**不会双跑**（按 identity 去重），迁移可以分两步走。
+
+⚠️ 只放**幂等的上下文注入**（`request_id` / `client_ip` / `lang` / `trace`）。
+**做准入决策的一律不准进**（鉴权、限流、权限）：全站链对所有包生效，包括 `/auth/login`
+与签名下载端点，把 `auth_middleware` 放进去一行配置就锁死全站。另外蓝图级中间件在
+路由匹配成功后才执行，**不覆盖 404**——需要覆盖 404 的（访问日志、trace）用 Sanic
+原生的 app 级中间件，不要混进 `__mid__` 体系。
+
+**`controller_package` 可以收列表**：`create_app(["app.controller", "appx.controller"])`
+——一个进程按需装配若干业务包，用于「不同模块部署到不同服务」。各包独立扫描、各自继承
+自己的根 `__mid__.py`，**互不影响**（中间件是逐个复制到蓝图对象上的，不存在共享容器）。
+唯一的跨包约束是蓝图名全局唯一。
+
+**内置蓝图统一带 `webx_` 前缀**（`webx_user` / `webx_file` / `webx_auth` …），业务侧可以
+自由使用 `user`、`file` 这些自然名字。蓝图名是**全局唯一的命名空间**，与 URL 前缀无关——
+两个蓝图哪怕路径毫不相干，重名照样抛 `AssertionError: Blueprint names must be unique`。
+反过来，`/api` 这个前缀**不被任何人占有**：它只是字符串，业务用 `/api/order`、`/api/note`
+不受任何限制，只要具体路径不与内置的 `/api/user/*`、`/api/files/*`、`/api/admin/*`、
+`/auth/*`、`/public/files/*` 相撞即可（撞了会 `RouteExists`，启动即崩，不会带病上线）。
+
+中间件是**蓝图级**的：请求命中哪个蓝图的路由，就跑那个蓝图的链。所以 URL 前缀相同的
+两个蓝图（内置 `/api/user` 与业务 `/api/order`）各走各的中间件，不存在任何串扰。
+
+**跨模块 import 的蓝图会被自动剔除**：扫描器按路由 handler 的 `__module__` 判定蓝图归属，
+`from ..task import *` 顺手带进来的别组蓝图**无声跳过**，不会被挂上本组的中间件。
+判据管不到的两种情况各有兜底、且都是启动即失败，绝不静默改动鉴权链：显式
+`__blueprints__` 里写了别人的蓝图 → `DuplicateBlueprintError`；蓝图被判为外来却无人
+注册（接口会静默 404）→ 扫描后核对，抛 `OrphanBlueprintError`，修法是在真正拥有它的
+模块里声明 `__blueprints__ = [该蓝图]`。
+
 **2. 路径不再靠 `__file__` 上溯，配置与文案也不在 core 里**
 
 webx 是独立安装的包，`Path(__file__).parent.parent` 只会溯到 site-packages。
@@ -69,7 +103,7 @@ controller 目录由 `importlib.util.find_spec(包名)` 反查，包与目录永
 **3. 配置与异常不再写死在框架里**
 
 - `BaseSettings` 只有通用字段，业务继承后 `configure_settings()` 注册；框架内部拿到的是延迟解析的代理。
-- 模型模块由 `MODELS_MODULES` 声明，框架不假设业务模型叫什么。
+- 模型模块**跟随装配的模块**按约定扫出来（`<pkg>/models`），没有配置项，框架也不假设业务模型叫什么。
 - i18n 改注册表（`register(lang, {...})`），文案不再是框架里的一个 dataclass。
 - 异常收敛成 `WebxError` 基类 + 一个处理器，加异常不改主入口。
 
@@ -88,11 +122,73 @@ python run.py --dev
 `pyproject.toml` 里 `[tool.uv] package = false` 就是这个意思：代码靠 `sys.path`
 直接 import，改完即生效，不需要重新安装。
 
+### 启动方式
+
+```bash
+python run.py --dev                       # 开发：单进程，好断点
+./server.sh --dev --workers 1             # 同上，但走 sanic CLI（热重载）
+./server.sh --workers 4                   # 生产：4 个 worker，崩了自动重启
+./server.sh --port 9000 --modules app,appx  # 指定端口与装配的业务模块
+```
+
+两种入口共用 `run.py` 里的**模块级** `app` 变量：`python run.py` 时
+`__main__` 守卫触发 `app.run()`；`sanic run:app` 时 Sanic 自己接管服务器，
+守卫不成立所以不会重复启动（重复调用 `app.run()` 会以
+`RuntimeError: context has already been set` 直接起不来）。
+
+### 装配什么：两个独立开关
+
+| 变量 | 管什么 | 取值 |
+|---|---|---|
+| `WEBX_BUILTIN` | **内置路由组**（框架自带的） | 不配 = 全挂 / `false` = 全不挂 / `auth,api` = 子集 |
+| `WEBX_MODULES` | **业务模块**（你写的代码） | `app` / `app,appx` |
+
+加载顺序是 **内置组恒在前、业务模块在后**。两者互不影响——`WEBX_MODULES=app`
+**不会**屏蔽内置路由，要关得用 `WEBX_BUILTIN=false`。
+
+```bash
+./server.sh --no-builtin             # 纯业务服务，零内置端点
+./server.sh --builtin auth,api       # 只要登录与用户/文件，不要 admin 后台
+```
+
+`WEBX_BUILTIN` 的取值语义——**只有显式 `false` 才不加载**：
+
+| 配置 | 结果 |
+|---|---|
+| 不配 / 留空 / 值看不懂（如 `xxx`） | 全挂 + WARNING（若是看不懂的值） |
+| `false` / `0` / `no` / `none` / `off` | 全不挂 |
+| `auth,api` | 只挂这两组 |
+| `auth,nope` | 只挂 `auth`，`nope` 剔除 + WARNING |
+
+组名写错**不中止启动**，剔除后继续；一个有效的都不剩就回退全加载。取舍是可用性优先
+——静默关掉全部内置路由会让 `/auth/login` 一起消失，比多挂几组更难排查。但每次回退
+都会打 WARNING，否则"我以为只挂了 auth"和"实际全挂了"就永远暴露不出来。
+
+⚠️ **默认全挂会带上用户 CRUD 与整套 admin 权限端点**，用不到就配 `false`，别白送攻击面。
+
+两个变量都有三个配置位，优先级由高到低：
+
+| 位置 | 写法 | 适用 |
+|---|---|---|
+| 命令行 | `./server.sh --modules app,appx --no-builtin`<br>`python tools/dbsync.py --modules app,appx` | 临时覆盖 |
+| shell 环境变量 | `WEBX_MODULES=app,appx WEBX_BUILTIN=false sanic run:app` | 容器 / systemd / CI |
+| `.env` | `WEBX_MODULES=app`<br>`WEBX_BUILTIN=` | **常规配置位** |
+
+⚠️ 两个容易踩的点：
+
+1. **`sanic` CLI 严格拒绝未知参数**（`sanic: error: unrecognized arguments`），不是忽略。
+   所以 `WEBX_MODULES=app,appx sanic run:app` 可以，`sanic run:app --modules=...` 不行。
+   `python run.py --modules app,appx` 则两条路都通，`server.sh` 已经处理好这个差异。
+2. 框架内部读它用的是 `env.str` 而**不是** `os.environ`——environs ≥ 15 的
+   `read_env()` 只写进 Env 实例、不回写 `os.environ`，用后者会让 `.env` 里的配置
+   静默失效。你自己写业务配置时同理，一律 `from webx.config import env`。
+
 目录长这样：
 
 ```
 myproject/
-├── run.py            启动入口
+├── run.py            启动入口（模块级 app，两种启动方式共用）
+├── server.sh         部署脚本：sanic CLI + 多 worker
 ├── .env
 ├── tools/            运维脚本，直接 python tools/xxx.py 跑
 │   ├── dbsync.py     表结构同步
@@ -100,11 +196,10 @@ myproject/
 │   └── org.py        组织与权限初始化
 ├── app/              ← 你的业务代码，改这里（自带的 note/welcome 是示例，可直接删）
 │   ├── config.py     class Settings(BaseSettings) + configure_settings()
-│   ├── main.py       app = create_app("app.controller")
-│   ├── i18n.py       register("zh", {...})
-│   ├── models/       MODELS_MODULES 指向这里
+│   ├── i18n.py       register("zh", {...})       ← 按约定自动 import
+│   ├── models/       按约定自动挂接（改名 _models 即排除）
 │   ├── middlewares/  自己的中间件，一件一文件
-│   └── controller/
+│   └── controller/   ← 按约定被扫描（必须存在）
 │       ├── __mid__.py   MIDDLEWARES = [request_id, client_ip, lang]
 │       ├── public.py    公开接口
 │       └── api/
@@ -113,6 +208,15 @@ myproject/
 ├── webx/             ← 框架代码，一般不用改
 └── tests/
 ```
+
+**业务侧不需要写入口模块**。`create_app(modules=["app"])` 按目录约定装配：
+`<pkg>/controller/` 必须有（缺了报错——静默跳过等于"装配成功但一个接口都没有"），
+`<pkg>/i18n.py` 与 `<pkg>/models` 存在就自动挂上、不存在就跳过。
+
+开一个新业务模块只要三步：建 `controller/` 写路由、需要文案就加 `i18n.py`、
+需要自己的配置就写 `config.py`（独立 dataclass，用 `from webx.config import env`
+读同一份 `.env`，与全局互不干扰）。要 admin 角色控制就直接
+`from webx.middleware.perm import require_permission`——没有任何注册或声明文件。
 
 `webx/` 与 `app/` 结构对称，且**严格自底向上分层**（下层绝不 import 上层）：
 
@@ -146,7 +250,7 @@ webx/
 
 开箱即有 39 条路由，其中 33 条是 `webx/controller/` 内置的，业务侧一行挂载代码都不用写。
 `app/` 里自带的 `Note` 模型与 `/public/welcome`、`/api/notes` 只是示例，
-用来演示中间件链与目录约定——起项目时删掉即可（`Note` 表会跟着 `MODELS_MODULES` 建出来）。
+用来演示中间件链与目录约定——起项目时删掉即可（`Note` 表跟着 `app/models` 自动建出来）。
 
 三个文件的核心内容：
 
@@ -157,14 +261,13 @@ from webx.config import BaseSettings, configure_settings, env
 
 @dataclass
 class Settings(BaseSettings):
-    MODELS_MODULES: list[str] = field(default_factory=lambda: ["app.models"])
+    # 只写业务自有字段；模型模块按约定自动挂接，无需声明
     WELCOME_TEXT: str = field(default_factory=lambda: env.str("WELCOME_TEXT", "hi"))
 
 settings = configure_settings(Settings())
 
-# app/main.py
-from webx.core.app import create_app
-app = create_app("app.controller")
+# run.py —— 唯一入口，业务不需要写 app/main.py
+app = create_app(modules=["app"])     # 按约定展开 app/controller、app/i18n
 
 # app/controller/api/__mid__.py
 from webx.middleware import auth_middleware
@@ -227,6 +330,7 @@ __blueprints__ = lambda: [make_note_blueprint()]
 ```bash
 # 表结构同步：模型即权威
 python tools/dbsync.py
+python tools/dbsync.py --modules app,appx   # 额外带上这些模块的 <pkg>.models
 python tools/dbsync.py --debug     # 打印每条 DDL
 python tools/dbsync.py --drop      # 删除模型中已不存在的列（危险）
 
@@ -249,17 +353,22 @@ python tools/admin.py delete -u alice
 
 脚本自己把项目根塞进 `sys.path`（见 `tools/_bootstrap.py`），所以从任何目录执行都成立。
 
+**建表范围与服务装配同源。** 同步的模型 = `--modules` / `WEBX_MODULES` 指定的各模块的
+`<pkg>/models`，外加 `webx/models`（未显式关掉内置路由时）。**没有模型清单配置项**——
+服务进程读同一个环境变量、走同一个 `apply_module_models`，所以
+
+```bash
+WEBX_MODULES=app,appx python tools/dbsync.py   # 建表
+WEBX_MODULES=app,appx ./server.sh              # 起服务
+```
+
+两条命令覆盖的模块集合必然一致。若两边各算各的，就会出现「服务路由齐全但表没建」
+——接口一查库就 `no such table`，而建表那一步毫无征兆。
+
 ## 用户体系与权限体系
 
-启用只有两步：把 `"webx.models"` 列进 `MODELS_MODULES`，跑一次 `dbsync` 建表。
-路由由 `create_app` 自动挂载（`builtin_controller=True` 是默认值）。
-
-```python
-# app/config.py
-MODELS_MODULES: list[str] = field(
-    default_factory=lambda: ["app.models", "webx.models"]
-)
-```
+启用只有一步：跑一次 `dbsync` 建表。路由与模型都自动挂接——只要没显式关掉内置路由
+（`WEBX_BUILTIN=false`），`webx/models` 就跟着一起走，**不需要在任何地方声明**。
 
 表：`user` / `superadmin` / `verify_code` / `organization` / `user_org` /
 `user_role` / `permission` / `role_permission` / `user_permission`。

@@ -1,10 +1,19 @@
 """表结构同步 CLI：模型定义即权威，DDL 自动对齐。
 
-    python tools/dbsync.py           # 同步
-    python tools/dbsync.py --debug   # 打印每条 DDL
-    python tools/dbsync.py --only User Order
-    python tools/dbsync.py --drop    # 删除模型中已不存在的列（危险）
-    python tools/dbsync.py --force   # 类型不兼容则重建列、清理非模型索引
+    python tools/dbsync.py                    # 同步（模型跟随装配的模块）
+    python tools/dbsync.py --modules app,appx # 额外带上这些模块的 <pkg>.models
+    python tools/dbsync.py --debug            # 打印每条 DDL
+    python tools/dbsync.py --only User Order  # 仅同步指定模型（按类名）
+    python tools/dbsync.py --drop             # 删除模型中已不存在的列（危险）
+    python tools/dbsync.py --force            # 类型不兼容则重建列、清理非模型索引
+
+同步范围 = ``--modules`` / ``WEBX_MODULES`` 指定的各模块的 ``<pkg>/models``，
+         外加 ``webx/models``（未显式关掉内置路由时）。**没有模型清单配置项**：
+         装配哪个模块就带上它的 models，改名成 ``_models.py`` 即可排除。
+
+⚠️ 建表范围必须与服务进程一致。服务读 ``WEBX_MODULES``（见 run.py / server.sh），
+所以这里默认也读它——两边同源，才不会出现「服务路由齐全但表没建」。
+用 ``--modules`` 可以只对某几个模块建表（如按模块分库部署时）。
 """
 
 from __future__ import annotations
@@ -42,6 +51,12 @@ async def _sync(args: argparse.Namespace) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="webx 表结构同步")
+    parser.add_argument(
+        "--modules",
+        default=None,
+        help="逗号分隔的业务模块包名，如 app 或 app,appx；"
+        "其 <pkg>.models 会并入同步范围（默认取环境变量 WEBX_MODULES）",
+    )
     parser.add_argument("--only", nargs="*", default=None, help="仅同步指定模型（类名）")
     parser.add_argument("--force", action="store_true", help="类型不兼容则重建，清理非模型索引")
     parser.add_argument("--drop", action="store_true", help="删除模型中不存在的列（危险）")

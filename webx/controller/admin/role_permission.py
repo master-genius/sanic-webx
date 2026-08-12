@@ -7,7 +7,7 @@ from sanic.response import json
 from webx.models.rbac import RolePermission
 
 
-role_perm_bp = Blueprint("role_permission", url_prefix="/api/admin/role-permission")
+role_perm_bp = Blueprint("webx_role_permission", url_prefix="/api/admin/role-permission")
 
 
 @role_perm_bp.get("/")

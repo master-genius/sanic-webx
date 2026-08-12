@@ -1,6 +1,6 @@
 """数据模型。
 
-用到哪些就把 ``"webx.models"`` 列进业务的 ``MODELS_MODULES``，跑 dbsync 建表。
+只要没显式关掉内置路由（``WEBX_BUILTIN=false``），本模块就会被自动挂接，跑 dbsync 建表。
 不需要用户体系的项目不列它即可，框架其余部分不依赖这些表。
 """
 
