@@ -39,7 +39,7 @@ from typing import List
 
 from webx_worker import envnames as E
 from webx_worker.sdk import upload_queue as q
-from webx_worker.sdk.result_client import upload_result
+from webx_worker.sdk.result_client import check_result_filename, upload_result
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,7 @@ def _deliver(
     *,
     required: bool,
 ) -> str:
+    check_result_filename(remote_name)      # 响亮失败：不让坏名字进入重试 / 降级进队列的路径
     src = Path(local_path)
     if not src.is_file():
         return ""

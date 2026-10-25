@@ -78,6 +78,12 @@ POST  /internal/uploads/U/complete                       → {"key","size", ...}
 
 ### 任务产物策略 `task_results`
 
+**文件名规则（全服务唯一，所有路由一致）**：文件名是**单段**——不得含 `/` 或 `\`（及 NUL），不得为空或 `.` / `..`；
+违反一律 `400`，**不会**被截取成末段悄悄存下来（`a/b.txt` 不会变成 `b.txt`）。适用于上传（含兼容别名与分片会话）、
+签名、删除；公开读取遇到这类名字回 `404`。（通用对象接口 `/internal/objects` 的 `key` 本来就是多级路径，不受此限；
+主站 `/api/files` 的整传同样拒绝含路径分隔符的文件名。）
+worker 的 `deliver_*` / `upload_result` 在客户端入口就对这类名字抛 `ValueError`，不会走到服务端才被拒。
+
 键布局 `tasks/<task_id>/results/<filename>`。"任务产物"在这里只是一种**键布局**，
 存储服务不知道任务是什么。
 

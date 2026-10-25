@@ -254,14 +254,66 @@ def test_create_task_result_returns_download_url(app):
     assert app.test_client.get("/internal/objects/tasks/T1/results/em.zip", headers=H)[1].body == b"zipdata"
 
 
-def test_form_filename_overrides_part_filename_and_traversal_is_flattened(app):
+def test_form_filename_overrides_part_filename(app):
     body, ct = mp(("filename", None, "renamed.bin".encode()), ("file", "orig.bin", b"x"))
     r = app.test_client.post("/internal/tasks/T2/results", data=body, headers={**H, **ct})[1]
     assert r.json["filename"] == "renamed.bin"
 
-    body, ct = mp(("file", "../../evil.bin", b"x"))
-    r = app.test_client.post("/internal/tasks/T2/results", data=body, headers={**H, **ct})[1]
-    assert r.status == 201 and r.json["filename"] == "evil.bin", "路径成分被砍掉，不会写到任务目录之外"
+
+# 文件名规则全服务唯一：不得含 / 或 \\，不得是空串 / . / ..。一律拒绝，**不**截取末段——
+# 截取意味着调用方存进去的名字和它以为的不一样，而且永远不知道。
+BAD_NAMES = ["a/b.txt", "../x.bin", "../../evil.bin", "/abs.bin", "a\\b", ".", "..", "a\x00b"]
+
+
+def _stored_files(cfg):
+    return [p for p in __import__("pathlib").Path(cfg.STORAGE_DIR).rglob("*") if p.is_file()]
+
+
+@pytest.mark.parametrize("bad", BAD_NAMES)
+def test_filenames_with_path_components_are_rejected_not_flattened_on_every_route(make_app, bad):
+    app, cfg = make_app()
+    c = app.test_client
+
+    # 规范上传（文件名走表单字段，避开 multipart 对反斜杠 / NUL 的自身解析差异）
+    body, ct = mp(("filename", None, bad.encode()), ("file", "ok.bin", b"x"))
+    assert c.post("/internal/tasks/T9/results", data=body, headers={**H, **ct})[1].status == 400
+    # 兼容别名行为一致
+    body, ct = mp(("filename", None, bad.encode()), ("file", "ok.bin", b"x"))
+    assert c.post("/internal/tasks/T9/results/upload", data=body, headers={**H, **ct})[1].status == 400
+    # 分片会话（规范 + 别名）
+    assert c.post("/internal/tasks/T9/results/uploads", json={"filename": bad}, headers=H)[1].status == 400
+    assert c.post("/internal/tasks/T9/results/upload/init", json={"filename": bad}, headers=H)[1].status == 400
+    # 签名（规范 + 别名）
+    assert c.post("/internal/tasks/T9/signatures", json={"filename": bad}, headers=H)[1].status == 400
+    assert c.post("/internal/sign", json={"task_id": "T9", "filename": bad}, headers=H)[1].status == 400
+    assert not _stored_files(cfg), "被拒绝的名字不得在任务目录里留下任何东西"
+
+
+@pytest.mark.parametrize("bad", ["a/b.txt", "../x.bin"])
+def test_part_filename_with_path_components_is_rejected_and_nothing_is_written(make_app, bad):
+    app, cfg = make_app()
+    body, ct = mp(("file", bad, b"x"))
+    r = app.test_client.post("/internal/tasks/T9/results", data=body, headers={**H, **ct})[1]
+    assert r.status == 400
+    assert not _stored_files(cfg)
+
+
+def test_single_segment_names_with_dots_and_unicode_are_still_accepted(app):
+    for ok in ("a.b.c.txt", "报告 v2.pdf", ".hidden-ish.bin"[1:], "x"):
+        r = post_file(app, "/internal/tasks/T9/results", filename=ok)
+        assert r.status == 201 and r.json["filename"] == ok, (ok, r.text)
+
+
+def test_delete_and_public_read_of_a_name_with_path_components(app):
+    post_file(app, "/internal/tasks/T9/results", filename="b.txt", data=b"keep")
+    # DELETE：路径里的 / 本来就是多段；编码后的 %2F 解码出的名字含 /，必须 400 而不是删掉 b.txt
+    r = app.test_client.delete("/internal/tasks/T9/results/a%2Fb.txt", headers=H)[1]
+    assert r.status == 400
+    assert app.test_client.delete("/internal/tasks/T9/results/a/b.txt", headers=H)[1].status == 400
+    assert app.test_client.get(result_url("T9", "b.txt"))[1].body == b"keep", "b.txt 不得被误删"
+    # 公开读：不泄露、不截取——一律 404（规则 7），而不是悄悄返回 b.txt
+    assert app.test_client.get(result_url("T9", "a/b.txt"))[1].status == 404
+    assert app.test_client.get(result_url("T9", "..%2Fb.txt"))[1].status == 404
 
 
 @pytest.mark.parametrize("bad_task", ["a.b", "a b", "..", "a;b"])

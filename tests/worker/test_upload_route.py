@@ -284,3 +284,38 @@ def test_missing_file_returns_empty():
     assert url == "" and stub.calls == []
 
 
+
+
+# ==================== 三、文件名：含路径分隔符一律在客户端入口响亮失败 ====================
+
+
+def test_names_with_path_components_fail_loudly_before_any_upload_or_enqueue():
+    """服务端对所有路由都拒绝含 / 或 \\ 的文件名（400）。客户端若不在入口拦住，
+    坏名字会走“同步失败→降级进队列→uploader 永不放弃地重试”，把一个调用方 bug 变成永远清不掉的僵尸条目。"""
+    import pytest
+
+    for bad in ("a/b.bin", "../x.bin", "/abs.bin", "a\\b", "", ".", ".."):
+        for fn in (R.deliver_required, R.deliver_only):
+            work, f = _bed(1)
+            stub = _Sync()
+            old, R.upload_result = R.upload_result, stub
+            try:
+                with _Env(WEBX_WORKER_WORK_DIR=str(work), WEBX_WORKER_UPLOADER_ENABLED="true",
+                          WEBX_WORKER_STORAGE_INTERNAL_URL="http://storage.invalid"):
+                    with pytest.raises(ValueError):
+                        fn("t1", f, bad, ["step2", "out_url"])
+            finally:
+                R.upload_result = old
+            assert stub.calls == [], f"{bad!r} 不得发出上传请求"
+            assert q.iter_pending(work) == [], f"{bad!r} 不得进队列"
+
+
+def test_upload_result_rejects_bad_explicit_names_but_uses_the_local_basename_by_default():
+    import pytest
+
+    from webx_worker.sdk import result_client as RC
+
+    work, f = _bed(0.001)
+    with pytest.raises(ValueError):
+        RC.upload_result("t1", f, filename="sub/dir.bin")
+    assert RC.check_result_filename("报告 v2.pdf") == "报告 v2.pdf"

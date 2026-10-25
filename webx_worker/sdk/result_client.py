@@ -230,6 +230,17 @@ def resolve_storage_url(download_url: str) -> str:
     return f"{access.rstrip('/')}/{download_url.lstrip('/')}" if access else download_url
 
 
+def check_result_filename(name: str) -> str:
+    """产物文件名必须是单段：不含 ``/`` 或 ``\\``，不是空串 / ``.`` / ``..``，不含 NUL。
+
+    服务端对所有路由都是这条规则（含则 400）。在**客户端入口**就响亮失败，
+    而不是上传到一半才被服务端拒绝——后者在重试 / 降级进队列的路径上会被当成瞬时故障反复尝试。
+    """
+    if not name or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+        raise ValueError(f"非法产物文件名（不得为空，不得含路径分隔符）: {name!r}")
+    return name
+
+
 def upload_result(
     task_id: str,
     file_path: str | Path,
@@ -241,14 +252,14 @@ def upload_result(
     见 docs/storage-service.md）。实际请求走【内网】访问地址，落库 download_url 则用
     【对外】地址（见下）。超大文件应走 uploader 的分片续传（见 upload_route）。
     """
+    local_path = Path(file_path)
+    target_name = check_result_filename(filename or local_path.name)   # 入参校验先于任何配置 / I/O
+
     base_url = _get_storage_access_url()
     _, main_token = _get_config()
 
-    local_path = Path(file_path)
     if not local_path.exists():
         raise FileNotFoundError(f"文件不存在: {local_path}")
-
-    target_name = filename or local_path.name
 
     # rstrip 防配置末尾斜杠拼出 //（严格反代会 404/400）
     url = f"{base_url.rstrip('/')}/internal/tasks/{task_id}/results"

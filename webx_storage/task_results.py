@@ -77,10 +77,15 @@ class TaskResultsPolicy(KeyPolicy):
 
     @staticmethod
     def check_filename(filename: Optional[str]) -> str:
-        """只留末段文件名，杜绝 ``../`` 穿越；字符集由存储的键规则再挡一道。"""
-        name = Path(filename or "").name
-        if not name or name in (".", ".."):
-            raise StoreError(f"非法 filename: {filename!r}", status=400)
+        """文件名必须是**单段**：不含 ``/`` 或 ``\\``（及 NUL），且不是空串 / ``.`` / ``..``。违反即 400。
+
+        这是全服务统一的规则（通用对象的 finalize 也是如此）。早先这里只取末段（``a/b.txt`` 悄悄存成
+        ``b.txt``），两处语义不一致，且调用方永远不知道自己的名字被改了——比被拒绝更糟。
+        字符集由存储的键规则再挡一道。
+        """
+        name = filename or ""
+        if not name or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+            raise StoreError(f"非法 filename（不得为空，不得含路径分隔符）: {filename!r}", status=400)
         return name
 
     def key_for(self, task_id: str, filename: str) -> str:
