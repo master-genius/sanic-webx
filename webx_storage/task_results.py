@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from typing import Optional
 from urllib.parse import unquote, urlsplit
 
