@@ -90,8 +90,8 @@ def test_login_rejects_bad_password(http_app, captured_codes_module):
     assert resp.status == 401
 
 
-def test_mobile_channel_blocked_when_unregistered(http_app):
-    """短信通道没注册时，发码端点必须明确拒绝而不是 500。"""
+def test_mobile_channel_blocked_when_unconfigured(http_app):
+    """短信默认已注册但没配凭证（is_ready 为 False）时，发码端点必须明确拒绝而不是 500。"""
     _, resp = http_app.test_client.post(
         "/auth/verifycode",
         json={"identifier": "13800138000", "channel_type": "mobile", "biz_type": "register"},
@@ -510,7 +510,7 @@ def test_change_by_code_requires_something_to_change(http_app):
 
 
 def test_change_by_code_mobile_blocked_without_sms(http_app):
-    """短信通道未注册时，手机找回要给明确提示而不是让用户干等验证码。"""
+    """短信未配置时，手机找回要给明确提示而不是让用户干等验证码。"""
     _, resp = http_app.test_client.post(
         "/auth/account/change-by-code",
         json={"mobile": "13800138000", "code": "123456", "new_password": "whatever1"},
@@ -527,64 +527,122 @@ def test_change_by_code_unknown_account_is_404(http_app):
     assert resp.status == 404
 
 
-def test_mobile_register_and_change_by_code(http_app, captured_codes_module):
+def test_mobile_register_and_change_by_code(http_app, fake_sms):
     """手机渠道全链路：注册 → 找回改密 → 新密码登录。
 
-    这是本次同步新增的能力，必须真跑一遍——只测「没短信时被挡住」覆盖不到它。
-    测试里临时注册一个假的短信通道，用完还原。
+    走默认注册的 mobile 通道 + 适配层，只把"服务商"换成假驱动：
+    不手工注册任何 sender，证明配好 .env 即可用。
     """
-    from webx.lib import senders
+    sent = fake_sms.sent
+    mobile = "13800138001"
 
-    sent: list[dict] = []
+    # ① 手机注册
+    http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": mobile, "channel_type": "mobile", "biz_type": "register"},
+    )
+    assert sent, "短信驱动应已收到注册验证码"
+    assert sent[-1]["to"] == mobile, "驱动拿到的是裸号"
+    assert sent[-1]["template"] == "SMS_TEST", "模板码来自 SMS_TEMPLATES 的 verify_code 场景"
 
-    async def fake_sms(identifier, code, *, valid_minutes, biz_type="", **_):
-        sent.append({"identifier": identifier, "code": code})
+    _, reg = http_app.test_client.post(
+        "/auth/register",
+        json={
+            "username": "mobuser",
+            "password": "secret123",
+            "mobile": mobile,
+            "code": sent[-1]["params"]["code"],
+        },
+    )
+    assert reg.status == 201, reg.text
+    assert reg.json["data"]["user"]["mobile"] == mobile
 
-    original = senders.get_sender("mobile")
-    senders.register_sender("mobile", fake_sms)
-    try:
-        mobile = "13800138001"
+    # ② 凭手机验证码改密（找回密码）
+    http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": mobile, "channel_type": "mobile", "biz_type": "change"},
+    )
+    _, resp = http_app.test_client.post(
+        "/auth/account/change-by-code",
+        json={"mobile": mobile, "code": sent[-1]["params"]["code"], "new_password": "bymobile1"},
+    )
+    assert resp.status == 200, resp.text
 
-        # ① 手机注册
-        http_app.test_client.post(
-            "/auth/verifycode",
-            json={"identifier": mobile, "channel_type": "mobile", "biz_type": "register"},
-        )
-        assert sent, "短信通道应已收到注册验证码"
+    # ③ 新密码可登录，且手机号本身也能当登录标识
+    _, login = http_app.test_client.post(
+        "/auth/login", json={"username": mobile, "password": "bymobile1"}
+    )
+    assert login.status == 200
 
-        _, reg = http_app.test_client.post(
-            "/auth/register",
-            json={
-                "username": "mobuser",
-                "password": "secret123",
-                "mobile": mobile,
-                "code": sent[-1]["code"],
-            },
-        )
-        assert reg.status == 201, reg.text
-        assert reg.json["data"]["user"]["mobile"] == mobile
 
-        # ② 凭手机验证码改密（找回密码）
-        http_app.test_client.post(
-            "/auth/verifycode",
-            json={"identifier": mobile, "channel_type": "mobile", "biz_type": "change"},
-        )
-        _, resp = http_app.test_client.post(
-            "/auth/account/change-by-code",
-            json={"mobile": mobile, "code": sent[-1]["code"], "new_password": "bymobile1"},
-        )
-        assert resp.status == 200, resp.text
+def _verify_code_rows(app, identifier):
+    with _e2e_db(app) as db:
+        return db.execute(
+            "SELECT COUNT(*) FROM verify_code WHERE identifier=?", (identifier,)
+        ).fetchone()[0]
 
-        # ③ 新密码可登录，且手机号本身也能当登录标识
-        _, login = http_app.test_client.post(
-            "/auth/login", json={"username": mobile, "password": "bymobile1"}
-        )
-        assert login.status == 200
-    finally:
-        if original is not None:
-            senders.register_sender("mobile", original)
-        else:
-            senders.unregister_sender("mobile")
+
+def test_sms_not_ready_is_blocked_before_any_db_write(http_app, fake_sms):
+    """开关开着但驱动没配齐 = 半启用：必须在落库之前挡住，不白占当日额度。"""
+    fake_sms.configured = False
+    mobile = "13800138010"
+
+    _, resp = http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": mobile, "channel_type": "mobile", "biz_type": "register"},
+    )
+    assert resp.status == 400
+    assert not fake_sms.sent
+    assert _verify_code_rows(http_app, mobile) == 0
+
+
+def test_sms_switch_off_blocks_even_when_driver_configured(http_app, fake_sms, monkeypatch):
+    from webx.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "SMS_ENABLED", False)
+    mobile = "13800138011"
+    _, resp = http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": mobile, "channel_type": "mobile", "biz_type": "register"},
+    )
+    assert resp.status == 400
+    assert not fake_sms.sent and _verify_code_rows(http_app, mobile) == 0
+
+
+def test_sms_provider_failure_is_502_and_burns_the_code(http_app, fake_sms):
+    """服务商发送失败：回 502，且该行验证码被烧成 EXPIRED，用户不会被自己的冷却期挡住。"""
+    from webx.lib.sms import SmsError
+
+    fake_sms.fail = SmsError("余额不足", code="isv.AMOUNT_NOT_ENOUGH")
+    mobile = "13800138012"
+    _, resp = http_app.test_client.post(
+        "/auth/verifycode",
+        json={"identifier": mobile, "channel_type": "mobile", "biz_type": "register"},
+    )
+    assert resp.status == 502
+
+    with _e2e_db(http_app) as db:
+        states = [r[0] for r in db.execute(
+            "SELECT state FROM verify_code WHERE identifier=?", (mobile,))]
+    assert states == ["expired"]
+
+
+def test_bind_mobile_endpoints_follow_sms_readiness(http_app, captured_codes_module, fake_sms):
+    """登录态绑定手机：未就绪时被挡，就绪后能发码（同一个 get_sender 闸）。"""
+    headers = _auth(http_app, captured_codes_module, "binder1", "binder1@example.com")
+
+    fake_sms.configured = False
+    _, blocked = http_app.test_client.post(
+        "/api/user/mobile/bind/code", json={"mobile": "13800138020"}, headers=headers
+    )
+    assert blocked.status == 400 and not fake_sms.sent
+
+    fake_sms.configured = True
+    _, ok = http_app.test_client.post(
+        "/api/user/mobile/bind/code", json={"mobile": "13800138020"}, headers=headers
+    )
+    assert ok.status == 200, ok.text
+    assert fake_sms.sent[-1]["to"] == "13800138020"
 
 
 # ==================== 找回密码发码：账号存在性前置闸 ====================

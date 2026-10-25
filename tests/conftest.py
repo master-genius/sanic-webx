@@ -83,6 +83,46 @@ def captured_codes_module():
     restore()
 
 
+@pytest.fixture
+def fake_sms(monkeypatch):
+    """走**真实默认路径**发短信：配置选中一个假驱动，截获 (to, template, params)。
+
+    链路是 验证码服务 → senders 里默认注册的 mobile 通道 → 网关 → 假驱动，
+    中间没有任何手工 register_sender，因此证明的正是「配好 .env 即可用」。
+    返回对象的 ``.sent`` 是截获列表，``.fail`` 置为异常实例则下次发送抛它。
+    """
+    from webx.config import get_settings
+    from webx.lib.sms import SmsDriver, gateway, register_driver
+
+    class Fake(SmsDriver):
+        name = "fake"
+        sent: list = []
+        fail = None
+        configured = True
+
+        def is_configured(self):
+            return self.configured
+
+        async def send(self, to, template_code, params=None, validity_period=None):
+            if self.fail:
+                raise self.fail
+            self.sent.append({"to": to, "template": template_code, "params": params})
+            return "fake-id"
+
+    driver = Fake()
+    driver.sent = []
+    register_driver("fake", lambda: driver)
+    cfg = get_settings()
+    monkeypatch.setattr(cfg, "SMS_ENABLED", True)
+    monkeypatch.setattr(cfg, "SMS_PROVIDER", "fake")
+    monkeypatch.setattr(cfg, "SMS_TEMPLATES", {"verify_code": "SMS_TEST"})
+    try:
+        yield driver
+    finally:
+        gateway._FACTORIES.pop("fake", None)
+        gateway._INSTANCES.pop("fake", None)
+
+
 @pytest.fixture(scope="session")
 def app_with_db(tmp_path_factory):
     """会话级应用 + sqlite。

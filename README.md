@@ -19,7 +19,7 @@
 | 目录 | 端点 |
 |---|---|
 | `controller/auth/` | 账密登录注册、管理员登录、验证码登录、找回密码、登出、刷新令牌 |
-| | 注册与找回都是**邮箱/手机二选一**；短信通道未注册时自动挡住手机路径 |
+| | 注册与找回都是**邮箱/手机二选一**；短信未配置或被关闭时自动挡住手机路径 |
 | `controller/api/` | 个人中心 + 文件：上传（整传/分片）、下载、签发限时链接、删除 |
 | `controller/admin/` | 账号 CRUD、角色/权限查询、用户角色管理、单独授权 |
 | `controller/public/` | 签名下载（无需登录，靠限时签名授权） |
@@ -390,21 +390,46 @@ WEBX_MODULES=app,appx ./server.sh              # 起服务
 
 ### 验证码发送通道
 
-邮件走 stdlib（永远可用），短信是可选依赖。通道用注册表管理，
-未注册的通道返回明确的"暂未开通"，而不是 ImportError：
+邮箱与手机号都是**基础能力**，两个通道都默认注册，不需要任何接线代码：
 
-```python
-from webx.lib.senders import register_sender
-from webx.lib.sms import SmsScene, send_scene_sms
+| 通道 | 实现 | 什么时候可用 |
+|---|---|---|
+| `email` | stdlib `smtplib` | 配了 `MAIL_*` |
+| `mobile` | 短信适配层 `webx.lib.sms` | `SMS_ENABLED=true`（默认）**且**所选服务商的凭证、签名齐备 |
 
-async def send_sms_code(identifier, code, *, valid_minutes, **kw):
-    await send_scene_sms(scene=SmsScene.VERIFY_CODE, to=identifier,
-                         params={"code": code}, validity_period=valid_minutes * 60)
+不可用的通道，所有入口（发码、注册、找回密码、绑定手机）一律回明确的「暂未开通」，
+并且在**限流统计与落库之前**就挡住——不会白写一行验证码、白占该号码的当日额度。
+所以：**配好 `.env` 就能发短信；不想要就 `SMS_ENABLED=false`。**
 
-register_sender("mobile", send_sms_code)
+```bash
+# .env
+SMS_PROVIDER=aliyun            # 服务商驱动，默认 aliyun
+SMS_ACCESS_KEY_ID=...
+SMS_ACCESS_KEY_SECRET=...
+SMS_SIGN_NAME=你的签名
+SMS_TEMPLATES={"verify_code":"SMS_123456789"}   # 场景 → 控制台报备的模板码
 ```
 
-短信另需 `uv sync --extra sms`（拉 httpx），业务 Settings 继承 `webx.lib.sms.SmsSettingsMixin`。
+模板变量名必须是 `${code}`。字段名与 deepmice-api 一致，`.env` 可直接复用。
+
+**服务商是可换的**：`webx/lib/sms/` 是适配层——`base.py` 定义驱动契约 `SmsDriver`，
+`gateway.py` 是与服务商无关的统一入口，`aliyun.py` 是目前唯一的驱动。业务代码只面对：
+
+```python
+from webx.lib.sms import SmsScene, send_scene_sms, is_ready
+
+await send_scene_sms(SmsScene.VERIFY_CODE, "13800138000", {"code": "123456"})
+```
+
+接入新服务商 = 实现 `SmsDriver`（`is_configured()` + `send()`）、`register_driver("名字", 工厂)`，
+再把 `SMS_PROVIDER` 指过去，调用方与验证码服务一行不用动。`SMS_PROVIDER` 写了没注册的名字时，
+短信视为不可用，并打一条 ERROR（同一个名字只打一次）。
+
+⚠️ 阿里云驱动的签名与请求构造由单元测试（`httpx.MockTransport`）覆盖，但**没有对着真实
+阿里云验证过**——首次启用请用真实 AK/SK 与已审核的模板联调一次。
+
+邮件与短信之外的渠道，或想整个换掉默认实现，用 `webx.lib.senders.register_sender(渠道, 函数)`
+覆盖即可（可选 `enabled=` 传入「当前是否可用」的判断）。
 
 ## 文件上传下载
 
