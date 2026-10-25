@@ -80,9 +80,11 @@ def parse_filters(body: dict) -> tuple[int | None, int | None, str | None]:
             v = int(raw)
         except (TypeError, ValueError):
             return None, None, f"invalid {key}"
+        # 上界：level 列是 smallint、compute_points 是 integer。超范围的值会让 asyncpg 在计划阶段拒绝参数，
+        # 表现为不管池里有没有任务都 503，worker 无限退避重试。钳到列的最大值（上限语义下等价于“不限”）
         if v < 0:
             return None, None, f"invalid {key}"
-        out.append(v)
+        out.append(min(v, 32767 if key == "max_level" else 2**31 - 1))
     return out[0], out[1], None
 
 
@@ -98,6 +100,8 @@ async def create_lease(request: Request):
     "保活一条长寿连接"的原因，也因此结构上不存在"半开连接静默停收任务"的故障。
     """
     body = request.json or {}
+    if not isinstance(body, dict):
+        return json({"error": "invalid body"}, status=400)
     # worker_id 与内部写端点的 fencing 令牌走**完全同一条规则**（header 优先，其次 body）。
     # 认领时写进行里的 worker_id，正是此后每一次回调要拿来比对的那半个令牌——两处的解析规则若有任何差异
     # （大小写、strip、优先级），就会出现"领得到任务、但所有上报都被判为不是租户"这种极难排查的错位。

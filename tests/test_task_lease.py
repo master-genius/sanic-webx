@@ -409,3 +409,49 @@ async def test_ensure_claim_index_is_idempotent_and_repairs_a_dropped_index(pgdb
         "SELECT indexdef FROM pg_indexes WHERE indexname = $1", [Task.CLAIM_INDEX_NAME]
     )
     assert "level DESC" in cols[0]["indexdef"] and "compute_points DESC" in cols[0]["indexdef"]
+
+
+# ==================== 审查修复 ====================
+
+
+async def test_a_released_waiting_task_cannot_be_revived_by_a_late_heartbeat_or_release(pgdb):
+    """多阶段中间步 complete 会释放租约（lease_until=NULL）并保留 worker_id / lease_seq，令牌仍匹配。
+    迟到的心跳若能把租约写回去，到期后回收循环就会把这个正在等用户追加参数的任务当成失联 worker 回收。"""
+    t = await mk(status=TaskStatus.RUNNING, sub_status=SubStatus.SUCCESS, worker_id="w1", lease_seq=2,
+                 lease_until=None, steps="[]")
+    assert await lease.renew_lease(t.id, "w1", 2) is None, "心跳不得复活已释放的租约"
+    assert await lease.release_lease_fenced(t.id, "w1", 2) is False, "也不能被“归还”拉回池里"
+    after = await fresh(t)
+    assert (after.status, after.sub_status, after.lease_until, after.lease_seq) == (
+        TaskStatus.RUNNING, SubStatus.SUCCESS, None, 2)
+    assert await lease.reclaim_expired() == []
+
+
+async def test_every_claim_starts_a_fresh_run_so_grace_restarts_from_the_floor(pgdb):
+    """认领清空 start_time：留着上一轮（可能几十小时前）的值，重领后 ack 前的租约会长达数小时。"""
+    from datetime import datetime, timedelta, timezone
+
+    t = await mk(start_time=datetime.now(timezone.utc) - timedelta(hours=40))
+    row = await claim.claim_one("w1", ["demo"])
+    assert row and row["id"] == t.id
+    assert (await fresh(t)).start_time is None
+    renewed = await lease.renew_lease(t.id, "w1", row["lease_seq"])
+    assert renewed["lease_remaining_ms"] < 10 * 60_000, "首跑口径的 grace（下限 180s），不是 40 小时 × α"
+
+
+async def test_claim_for_slots_returns_what_it_already_claimed_when_a_later_slot_errors(monkeypatch):
+    """第二个槽位出错时不能丢掉第一个槽位已认领（已翻成 QUEUED）的任务，否则它要等短租约到期才回池。"""
+    first = await mk(task_type="a")
+    real = claim.claim_one
+    calls = {"n": 0}
+
+    async def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("db hiccup")
+        return await real(*a, **k)
+
+    monkeypatch.setattr(claim, "claim_one", flaky)
+    got = await claim.claim_for_slots("w1", [["a"], ["b"]])
+    assert [r["id"] for r in got] == [first.id]
+    assert (await fresh(first)).status == TaskStatus.QUEUED

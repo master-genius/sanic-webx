@@ -414,6 +414,19 @@ class TaskService:
             return "deferred_quota"
 
         try:
+            # 先预检、后翻转：闸门（参数 / 钩子 / 点数）若在翻成 PENDING 之后才拒绝，被拒的子任务仍待在池里、
+            # 被 worker 领走执行——“闸门拒绝”变成了“照样跑”。预检不通过：额度类留队等下一轮，其余直接判失败
+            try:
+                await cls.precheck_submittable(child, child.sub_step or "")
+            except QuotaExceededError:
+                return "deferred_quota"
+            except Exception as e:  # noqa: BLE001 —— 参数非法 / 类型钩子拒绝：这个子任务永远过不了闸
+                await Task.filter(id=child.id, status=TaskStatus.DRAFT, auto_post=1).update(
+                    status=TaskStatus.FAILED, sub_status=SubStatus.FAILED, auto_post=0,
+                    error_message=f"准入被拒绝: {e}"[:500], updated_at=_now(),
+                )
+                logger.warning("[Admit] 子任务 %s 预检不通过，判失败: %s", child.id, e)
+                return "failed"
             # 原子认领：仅当仍是 DRAFT+auto_post=1+未软删才接管，防与取消 / 删除竞态。走 claim_auto_post_child
             # 而不是手写 update：这条 UPDATE 还要写分发排序键，其公式只能在 SQL 里求值且必须与进池共用同一份
             if not await claim_auto_post_child(child.id):
@@ -461,11 +474,19 @@ class TaskService:
         retry 不得对子任务直发 ``submit_task``（豁免并发闸 → 击穿额度）。本方法把子任务重置回
         ``DRAFT + auto_post=1`` 后走 ``_try_admit_child``：额度内即时直投、超额则留队。
         """
-        await Task.filter(id=child.id).update(
+        if child.status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            raise ValueError(f"仅 FAILED/CANCELLED 的子任务可重试，当前: {child.status}")
+        cls._check_retry_budget(child)         # 子任务的 retry 同样消耗预算：否则可以无限重试
+        # 与 retry_task 同口径重置：requeues 不清零则下一次租约到期就被判“连续被回收超限”；sub_status 停在
+        # failed 则 worker 上报 running 会被状态机拒（failed → running）；error_message 不清用户看到的是旧错误
+        if not await Task.filter(id=child.id, status=child.status).update(
             status=TaskStatus.DRAFT, auto_post=1, worker_id="", lease_until=None,
             lease_seq=F("lease_seq") + 1,  # 同 retry：离开 QUEUED/RUNNING 即无租户，且必须 bump
+            sub_status=SubStatus.PENDING, retry=(child.retry or 0) + 1, requeues=0,
+            last_heartbeat=0, error_message="", step_message="",
             updated_at=_now(),
-        )
+        ):
+            raise TaskStateConflictError(child.id, str(child.status))
         fresh = await cls.get_task(child.id)
         if fresh:
             await cls._try_admit_child(fresh)
@@ -510,6 +531,17 @@ class TaskService:
             ok = await cls.submit_task(parent)
         except QuotaExceededError:
             logger.debug("[Admit] 父任务 %s 名额满，下一轮再试", parent.id)
+            return False
+        except ChildrenNotReadyError as e:
+            # 所有子任务都已终态、聚合闸门却仍不放行：必有子任务失败 / 取消。再等下去是永远等
+            # （每 30 秒一条 error 栈，还占着“等待中的父任务”名额，用户的 submit / PATCH 都被 409 挡回）。
+            # 给父任务一个明确的失败终态，用户可 retry 失败的子任务后再 retry 父任务
+            await Task.filter(id=parent.id, status=TaskStatus.DRAFT, auto_post=1).update(
+                status=TaskStatus.FAILED, sub_status=SubStatus.FAILED, auto_post=0,
+                error_message=f"子任务未全部完成，无法继续: 失败/取消 {e.failed}，未完成 {e.pending}"[:500],
+                updated_at=_now(),
+            )
+            logger.warning("[Admit] 父任务 %s 的子任务未全部完成，判失败: failed=%s pending=%s", parent.id, e.failed, e.pending)
             return False
         if not ok:
             return False
@@ -584,7 +616,9 @@ class TaskService:
         await cls.precheck_submittable(task, retry_step, params_text=merged)
 
         new_result, orphans = prune_result_path(task.task_type, task.result_path, new_steps)
-        await Task.filter(id=task.id).update(
+        # 状态守卫：双击 / 迟到的重复请求读到的都是 FAILED，第二个请求若无条件覆盖，会把已被 worker 领走、
+        # 正在运行的这一轮踢回池里（lease_seq +1 让健康 worker 的租约作废，任务被第二个 worker 重跑）
+        if not await Task.filter(id=task.id, status=task.status).update(
             status=TaskStatus.PENDING, params_text=merged, steps=json.dumps(new_steps),
             # log_path / result_path 与 steps 同一次写入裁剪：不清的话，前端在新一轮推出日志前一直显示上一轮内容，
             # 更要紧的是 worker 恢复时会把上一代的下载地址当当代产物取回来
@@ -596,7 +630,8 @@ class TaskService:
             # 让任务重回"无租户"：三个字段缺一不可。lease_seq += 1 最容易漏——上一轮 worker 的在途回调
             # 不 bump 的话仍然匹配，会写进用户刚重置的这一轮
             worker_id="", lease_until=None, lease_seq=F("lease_seq") + 1, updated_at=_now(),
-        )
+        ):
+            raise TaskStateConflictError(task.id, str(task.status))
         # 库已裁剪后再删文件（顺序不可反）。失败仅记日志，残留由存储侧的保留期清理兜底
         await cls._delete_orphans(task.id, orphans)
 
@@ -616,11 +651,12 @@ class TaskService:
         if task.status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
             raise ValueError(f"仅 FAILED/CANCELLED 状态可转回 DRAFT，当前: {task.status}")
         cls._check_retry_budget(task)
-        await Task.filter(id=task.id).update(
+        if not await Task.filter(id=task.id, status=task.status).update(   # 状态守卫，理由见 retry_task
             status=TaskStatus.DRAFT, sub_status=SubStatus.DRAFT, retry=(task.retry or 0) + 1,
             last_heartbeat=0, error_message="", step_message="", requeues=0,
             worker_id="", lease_until=None, lease_seq=F("lease_seq") + 1, updated_at=_now(),
-        )
+        ):
+            raise TaskStateConflictError(task.id, str(task.status))
         return await cls.get_task(task.id)
 
     @classmethod
@@ -653,7 +689,8 @@ class TaskService:
         new_steps = steps_list[:trunc_idx]
         merged = cls._merge_params(task, new_steps, step, params_text)
         new_result, orphans = prune_result_path(task.task_type, task.result_path, new_steps)
-        await Task.filter(id=task.id).update(
+        # 状态守卫：迟到的重复 redo 不能把已被重新领取、正在跑的步骤撤销
+        if not await Task.filter(id=task.id, status=task.status, sub_status=task.sub_status).update(
             status=TaskStatus.RUNNING, params_text=merged, steps=json.dumps(new_steps),
             log_path=prune_log_path(task.task_type, task.log_path, new_steps), result_path=new_result,
             sub_step=step, sub_status=SubStatus.DRAFT, retry=(task.retry or 0) + 1,
@@ -662,7 +699,8 @@ class TaskService:
             # 即"刚跑完一步、正等用户"，worker 早已返回、释放槽位、注销心跳，租约也在 complete 里主动释放，
             # 所以不会踩到活跃租约。仍然照清不误：不变量要靠每条路径各自成立，不能靠"上游应该已经清了"
             worker_id="", lease_until=None, lease_seq=F("lease_seq") + 1, updated_at=_now(),
-        )
+        ):
+            raise TaskStateConflictError(task.id, str(task.status))
         await cls._delete_orphans(task.id, orphans)
         return await cls.get_task(task.id)
 
@@ -739,21 +777,43 @@ class TaskService:
     # ==================== worker 回调：状态 / 完成 / 失败 / 步骤 / 字段 ====================
 
     @classmethod
-    async def update_status(cls, task: Task, new_status: TaskStatus, error_message: str = "") -> None:
-        """更新任务状态（带状态机校验，单次 save）。
+    async def update_status(
+        cls, task: Task, new_status: TaskStatus, error_message: str = "", *,
+        lessee: Optional[tuple[str, int]] = None,
+    ) -> None:
+        """更新任务状态（带状态机校验）。
 
         迁入 RUNNING 时顺带写入 ``start_time``（本轮计算起点）：worker 分布在多台机器、时钟与时区各异，
         所以时间基准由服务端单一生成，不接受 worker 传值。
+
+        写入是**带原状态（及租户）条件的原子更新**，不是对读入对象的 ``save()``：后者会用陈旧快照覆盖并发的
+        cancel / 回收（取消被静默撤销、或把已回池的任务写成无主 RUNNING）。条件不满足 → ``TaskStateConflictError``。
+        重复上报同一个状态（响应丢失后的重放）按幂等成功处理。
         """
-        extra: dict[str, Any] = {}
+        if new_status == task.status and new_status == TaskStatus.RUNNING:
+            return
+        if not task.can_transition_to(new_status):
+            raise ValueError(f"非法状态迁移：{task.status} → {new_status}")
+        extra: dict[str, Any] = {"status": new_status, "updated_at": _now()}
         if error_message:
             extra["error_message"] = error_message
         if new_status == TaskStatus.RUNNING:
             extra["start_time"] = _now()
-        await task.transition_to(new_status, **extra)
+        if not await cls._lessee_filter(Task.filter(id=task.id, status=task.status), lessee).update(**extra):
+            raise TaskStateConflictError(task.id, str(task.status))
+        for k, v in extra.items():
+            setattr(task, k, v)
+
+    @staticmethod
+    def _lessee_filter(q, lessee: Optional[tuple[str, int]]):
+        """给写入追加租户谓词。fencing 的“先查后写”只对读到写之间没有变化才成立；把令牌放进 UPDATE 的 WHERE，
+        判据才真正落在那条语句的 rowcount 上（回收 + 他人认领发生在检查与写入之间时，旧租户的写落空）。"""
+        if lessee is None:
+            return q
+        return q.filter(worker_id=lessee[0], lease_seq=lessee[1])
 
     @classmethod
-    async def complete_task(cls, task: Task) -> None:
+    async def complete_task(cls, task: Task, lessee: Optional[tuple[str, int]] = None) -> None:
         """完成任务（仅状态迁移，不写 result_path / log_path）。
 
         多阶段：``end_step=""`` 单阶段，completed 即终态；``end_step!=""`` 且 steps 末尾不是 end_step →
@@ -773,7 +833,7 @@ class TaskService:
         last_step = steps_list[-1] if steps_list else ""
 
         if fresh.end_step and last_step != fresh.end_step:
-            updated = await Task.filter(id=task.id, status=TaskStatus.RUNNING).update(
+            updated = await cls._lessee_filter(Task.filter(id=task.id, status=TaskStatus.RUNNING), lessee).update(
                 sub_status=SubStatus.SUCCESS, sub_step="",
                 # 🔴 必须在此释放租约：worker 跑完这一步后 execute() 就返回了——槽位释放、心跳注销，
                 # 没有任何人在给这个任务续租。不释放的话租约会自然到期，而回收判据是
@@ -790,7 +850,7 @@ class TaskService:
                 logger.warning("多阶段中间步更新失败（状态已变更）: task=%s", task.id)
             return
 
-        updated = await Task.filter(id=task.id, status=TaskStatus.RUNNING).update(
+        updated = await cls._lessee_filter(Task.filter(id=task.id, status=TaskStatus.RUNNING), lessee).update(
             status=TaskStatus.COMPLETED, sub_status=SubStatus.SUCCESS,
             lease_until=None,  # 终态释放租约（worker_id 保留作排查线索）
             requeues=0, updated_at=_now(),
@@ -801,16 +861,16 @@ class TaskService:
             logger.warning("完成任务时状态已变更，跳过: task=%s", task.id)
 
     @classmethod
-    async def fail_task(cls, task: Task, error_message: str) -> None:
+    async def fail_task(cls, task: Task, error_message: str, lessee: Optional[tuple[str, int]] = None) -> None:
         """失败任务（原子更新，强制 status / sub_status 双写 FAILED）。
 
         不变量：``status=FAILED ⇒ sub_status=FAILED``（成对终态）。filter 接受 RUNNING / FAILED 两态：
         上游 ``update_step_status(sub_status=FAILED)`` 可能已把 status 翻成 FAILED，此处仍需补写
         error_message 与对称字段，保证进程级错误 + 日志摘要必达。
         """
-        updated = await Task.filter(
+        updated = await cls._lessee_filter(Task.filter(
             id=task.id, status__in=[TaskStatus.RUNNING, TaskStatus.FAILED],
-        ).update(
+        ), lessee).update(
             status=TaskStatus.FAILED, sub_status=SubStatus.FAILED, error_message=error_message,
             # 终态释放租约。worker_id 刻意保留——"这个任务在哪台机器上失败的"是首要排查线索
             lease_until=None, updated_at=_now(),
@@ -824,6 +884,7 @@ class TaskService:
     async def update_step_status(
         cls, task: Task, steps: Optional[list[str]] = None, sub_step: Optional[str] = None,
         sub_status: Optional[str] = None, step_message: Optional[str] = None,
+        lessee: Optional[tuple[str, int]] = None,
     ) -> None:
         """更新步骤进度。仅 ``status=RUNNING`` 时接受写入（防御 stale worker 回调）。
 
@@ -874,7 +935,7 @@ class TaskService:
         # 原子条件写入：仅当任务仍为 RUNNING 才落库（与 cancel / complete / fail 互斥）。
         # 用 task.save(update_fields) 按 PK 局部写、守卫读内存 status 是 TOCTOU：worker 步骤回调与用户 cancel
         # 并发时，cancel 已把 status→CANCELLED，stale 的本调用仍过守卫、只写 steps/sub_status → 状态错配
-        updated = await Task.filter(id=task.id, status=TaskStatus.RUNNING).update(**fields)
+        updated = await cls._lessee_filter(Task.filter(id=task.id, status=TaskStatus.RUNNING), lessee).update(**fields)
         if not updated:
             logger.warning("步骤更新被丢弃：任务已非 RUNNING（并发 cancel/complete/fail），task=%s", task.id)
         elif fields.get("status") == TaskStatus.FAILED:
@@ -882,14 +943,30 @@ class TaskService:
                                   message=str(step_message or ""))
 
     @classmethod
-    async def update_fields_with_mode(cls, task: Task, fields: dict[str, str], mode: str = "overwrite") -> dict[str, str]:
-        """更新 result_path / log_path：``overwrite`` 直接覆盖，``merge`` 按 key 深度合并。"""
-        kwargs: dict[str, Any] = {}
-        for name, value in fields.items():
-            kwargs[name] = merge_field_path(getattr(task, name, ""), value) if mode == "merge" else value
-        result = dict(kwargs)
-        kwargs["updated_at"] = _now()
-        await Task.filter(id=task.id).update(**kwargs)
+    async def update_fields_with_mode(
+        cls, task: Task, fields: dict[str, str], mode: str = "overwrite", *,
+        lessee: Optional[tuple[str, int]] = None,
+    ) -> dict[str, str]:
+        """更新 result_path / log_path：``overwrite`` 直接覆盖，``merge`` 按 key 深度合并。
+
+        ``merge`` 在**行锁内重读**再合并：用调用方先读入的快照合并再整列写回，并发交付（上传进程同时交付多个
+        产物）会互相覆盖，16 个并发只剩 2 个键，而每个请求都回 200、上传进程据此把条目标记为已确认——产物静默丢失。
+        带 ``lessee`` 时还要求任务当前仍属该租户（见 ``_lessee_filter``）。
+        """
+        from tortoise.transactions import in_transaction
+
+        async with in_transaction():
+            row = await Task.filter(id=task.id).select_for_update().first()
+            if row is None:
+                return {}
+            if lessee is not None and (row.worker_id, row.lease_seq) != lessee:
+                raise TaskStateConflictError(task.id, str(row.status))
+            kwargs: dict[str, Any] = {}
+            for name, value in fields.items():
+                kwargs[name] = merge_field_path(getattr(row, name, ""), value) if mode == "merge" else value
+            result = dict(kwargs)
+            kwargs["updated_at"] = _now()
+            await Task.filter(id=task.id).update(**kwargs)
         for k, v in kwargs.items():
             setattr(task, k, v)
         return result

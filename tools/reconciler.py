@@ -48,6 +48,16 @@ async def _run(args: argparse.Namespace) -> int:
     if importlib.util.find_spec("webx.services.task") is not None:
         importlib.import_module("webx.services.task")
 
+    # 业务任务类型与钩子：与 web 同一约定——<pkg>/tasks.py（存在才加载）。
+    # 只 import 包并不会执行 tasks.py；补偿器若看到空的类型注册表，驱动的 submit_task（子任务准入、父任务提升）
+    # 就会按默认单阶段处理：跳过参数校验 / precheck / 点数闸，并把超时覆盖成默认值
+    from webx.config import env, module_exists
+
+    for pkg in [m.strip() for m in (args.modules or env.str("WEBX_MODULES", "app")).split(",") if m.strip()]:
+        if module_exists(f"{pkg}.tasks"):
+            importlib.import_module(f"{pkg}.tasks")
+            logging.info("补偿器已加载业务任务模块: %s.tasks", pkg)
+
     from webx.services.reconciler import build_reconciler
 
     overrides = {a[0].replace("-", "_"): getattr(args, a[0].replace("-", "_")) for a in _INTERVAL_ARGS}

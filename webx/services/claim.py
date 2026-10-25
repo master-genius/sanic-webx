@@ -87,6 +87,9 @@ UPDATE tasks SET
     lease_seq      = lease_seq + 1,
     lease_until    = {NOW_MS} + $2,
     last_heartbeat = {NOW_MS},
+    -- 每次认领都是新的一轮：start_time 清空，grace 才从下限起算。留着上一轮（可能是几十小时前）的值，
+    -- 重领后 ack 到上报 running 之间的租约会长达数小时，期间 worker 崩溃要等那么久才回收
+    start_time     = NULL,
     updated_at     = now()
 WHERE id = (
     SELECT id FROM tasks
@@ -160,9 +163,17 @@ async def claim_for_slots(
     """
     claimed: list[dict[str, Any]] = []
     for types in slots:
-        row = await claim_one(
-            worker_id, types, max_level=max_level, max_compute_points=max_compute_points
-        )
+        try:
+            row = await claim_one(
+                worker_id, types, max_level=max_level, max_compute_points=max_compute_points
+            )
+        except Exception:
+            if not claimed:
+                raise
+            # 前面的槽位已经认领成功（行已翻成 QUEUED）：此时抛错会让这些任务无人知晓，只能等短租约到期回池。
+            # 把已认领的先返回，出错的槽位下一轮再领
+            logger.exception("[claim] 槽位认领出错，先返回已认领的 %d 个", len(claimed))
+            break
         if row is not None:
             claimed.append(row)
     return claimed

@@ -89,7 +89,9 @@ register_failed_hook(notify)
 ```
 
 钩子注册表在**模块级**，与补偿器实例无关：钩子在 import 期注册，而那时业务配置往往还没注册，
-此时创建实例会读到过期的默认配置。`tools/reconciler.py` 用 `--modules` / `WEBX_MODULES` 把业务模块 import 进来。
+此时创建实例会读到过期的默认配置。`tools/reconciler.py` 按 `--modules` / `WEBX_MODULES` 加载每个业务模块的 **`<pkg>/tasks.py`**（存在才加载；web 同样按此约定加载）。
+**任务类型的登记（`register_task_type`）与补偿器钩子都应写在这个文件里**——只写在 controller 或 `run.py` 里，补偿器进程看到的类型
+注册表就是空的，它驱动的子任务准入、父任务提升会按默认单阶段处理（跳过参数校验 / precheck / 点数闸，超时被覆盖成默认值）。
 
 ## 配置
 

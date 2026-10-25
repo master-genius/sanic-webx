@@ -52,6 +52,12 @@ logger = logging.getLogger(__name__)
 internal_task_bp = Blueprint("webx_internal_task", url_prefix="/internal/tasks")
 
 
+def _lessee(request: Request):
+    """已通过 fence_lease 校验的请求所属租户 ``(worker_id, lease_seq)``，传给 service 写入 WHERE。"""
+    worker_id, seq = extract_fencing(request)
+    return (worker_id, seq) if worker_id and seq is not None else None
+
+
 async def _task_or_404(request: Request, task_id: str):
     lang = get_lang_from_header(request.headers)
     task = await task_service.get_task(task_id)
@@ -137,7 +143,7 @@ async def put_status(request: Request, task_id: str, body: TaskStatusUpdateReque
         # 这里直接设终态会留下 lease_until 未清、sub_status 仍是 pending 的半截状态
         return json({"error": "终态请使用 POST .../complete 或 .../fail", "code": "use_complete_or_fail"}, status=400)
     try:
-        await task_service.update_status(task, new_status, error_message=body.error_message)
+        await task_service.update_status(task, new_status, error_message=body.error_message, lessee=_lessee(request))
     except ValueError as e:
         return json({"error": str(e)}, status=400)
     return json({"message": t("success", lang)})
@@ -150,7 +156,7 @@ async def complete_task(request: Request, task_id: str):
     task, err = await _task_or_404(request, task_id)
     if err:
         return err
-    await task_service.complete_task(task)
+    await task_service.complete_task(task, lessee=_lessee(request))
     return json({"message": t("success", lang)})
 
 
@@ -162,7 +168,7 @@ async def fail_task(request: Request, task_id: str, body: TaskFailRequest):
     task, err = await _task_or_404(request, task_id)
     if err:
         return err
-    await task_service.fail_task(task, body.error_message)
+    await task_service.fail_task(task, body.error_message, lessee=_lessee(request))
     return json({"message": t("success", lang)})
 
 
@@ -195,7 +201,7 @@ async def patch_steps(request: Request, task_id: str, body: StepStatusUpdateRequ
     try:
         await task_service.update_step_status(
             task, steps=body.steps, sub_step=body.sub_step,
-            sub_status=body.sub_status, step_message=body.step_message,
+            sub_status=body.sub_status, step_message=body.step_message, lessee=_lessee(request),
         )
     except ValueError as e:
         return json({"error": str(e)}, status=400)
@@ -220,7 +226,7 @@ async def patch_fields(request: Request, task_id: str, body: TaskFieldUpdateRequ
     fields = {k: v for k, v in (("result_path", body.result_path), ("log_path", body.log_path)) if v is not None}
     if not fields:
         return json({"task_id": task_id, "message": "无字段需更新"})
-    updated = await task_service.update_fields_with_mode(task, fields, mode=mode)
+    updated = await task_service.update_fields_with_mode(task, fields, mode=mode, lessee=_lessee(request))
     return json({"task_id": task_id, "result_path": updated.get("result_path", task.result_path),
                  "log_path": updated.get("log_path", task.log_path)})
 

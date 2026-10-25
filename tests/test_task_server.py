@@ -272,3 +272,12 @@ def test_verify_script_fails_with_a_wrong_token_and_reports_unreachable(schema):
         stop_server(proc)
     assert run(f"http://127.0.0.1:{_free_port()}", TOKEN, check_db=False, timeout=2) == 2
 
+
+
+def test_malformed_lease_requests_are_400_or_clamped_not_500_or_503():
+    """非对象 JSON 体曾 500；max_level 超过 smallint 曾让 asyncpg 拒绝参数、表现为永远 503（worker 无限退避）。"""
+    from task_server.routes import parse_filters
+
+    assert parse_filters({"max_level": 40000}) == (32767, None, None)
+    assert parse_filters({"max_compute_points": 2**40}) == (None, 2**31 - 1, None)
+    assert parse_filters({"max_level": -1})[2] == "invalid max_level"

@@ -231,6 +231,9 @@ UPDATE tasks SET
     updated_at     = now()
 WHERE id = $5 AND worker_id = $6 AND lease_seq = $7
   AND status = ANY($8)
+  -- lease_until 为空 = 已主动释放租约（多阶段中间步等用户追加参数）。令牌仍匹配，但不能被心跳“复活”：
+  -- 复活后租约到期，回收循环会把这个正在等用户的任务当成失联 worker 回收掉并重投
+  AND lease_until IS NOT NULL
 RETURNING id, status, lease_until,
           (lease_until - {NOW_MS}) AS lease_remaining_ms
 """
@@ -345,6 +348,7 @@ UPDATE tasks SET
     updated_at     = now()
 WHERE id = $1 AND worker_id = $2 AND lease_seq = $3
   AND status = ANY($4)
+  AND lease_until IS NOT NULL      -- 已释放租约的等待态任务没有租户可归还，别把它拉回池里
 RETURNING id
 """
 

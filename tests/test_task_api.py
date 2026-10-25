@@ -715,3 +715,89 @@ def test_input_file_upload_during_submit_does_not_pull_the_task_back_to_draft(cl
     assert orm(dsn, go) is False
     row = fetch(dsn, "SELECT status, files_json FROM tasks WHERE id=$1", t["id"])[0]
     assert row["status"] == "pending" and "x" not in (row["files_json"] or "")
+
+
+def test_stale_retry_cannot_kick_a_running_task_back_to_the_pool(client, dsn):
+    """双击重试：第二个请求读到的仍是 FAILED，此时第一个请求已让任务被 worker 领走、正在运行。
+    无状态守卫的 UPDATE 会把健康 worker 的这一轮撤销（lease_seq+1，任务重新入池被别人重跑）。"""
+    from webx.models import Task
+    from webx.services.task import task_service
+
+    t = create(client, "dbl")
+    execute(dsn, "UPDATE tasks SET status='failed', sub_status='failed' WHERE id=$1", t["id"])
+
+    async def stale_retry_after_it_started_running():
+        stale = await Task.get(id=t["id"])                       # 请求 B 读到 FAILED
+        await Task.filter(id=t["id"]).update(status="running", sub_status="running", worker_id="w1", lease_seq=4)
+        with pytest.raises(Exception) as ei:                     # 请求 A 的结果：任务已在运行
+            await task_service.retry_task(stale)
+        return type(ei.value).__name__
+
+    assert orm(dsn, stale_retry_after_it_started_running) == "TaskStateConflictError"
+    row = fetch(dsn, "SELECT status, worker_id, lease_seq FROM tasks WHERE id=$1", t["id"])[0]
+    assert (row["status"], row["worker_id"], row["lease_seq"]) == ("running", "w1", 4), "正在运行的这一轮不能被撤销"
+
+
+def test_retrying_a_child_resets_it_and_spends_the_budget(client, dsn):
+    from webx.models import Task
+    from webx.services.task import task_service
+
+    parent, child = create(client, "rc"), create(client, "rc")
+    execute(dsn, """UPDATE tasks SET parent_id=$1, status='failed', sub_status='failed', requeues=10,
+                    error_message='boom', retry=0, allowed_retries=2 WHERE id=$2""", parent["id"], child["id"])
+
+    async def go():
+        await task_service.readmit_child(await Task.get(id=child["id"]))
+
+    orm(dsn, go)
+    row = fetch(dsn, "SELECT sub_status, requeues, error_message, retry FROM tasks WHERE id=$1", child["id"])[0]
+    assert (row["sub_status"], row["requeues"], row["error_message"], row["retry"]) == ("pending", 0, "", 1)
+
+    execute(dsn, "UPDATE tasks SET status='failed', retry=2 WHERE id=$1", child["id"])
+    with pytest.raises(ValueError):
+        orm(dsn, go)                                               # 预算用完：不能无限重试
+
+
+def test_concurrent_result_merges_keep_every_key(client, dsn):
+    """上传进程并发交付多个产物：读-改-写会互相覆盖（16 个只剩 2 个），而每个请求都回 200、条目被标记为已确认。"""
+    import asyncio
+
+    from webx.models import Task
+    from webx.services.task import task_service
+
+    t = create(client, "mg")
+
+    async def go():
+        async def one(i):
+            task = await Task.get(id=t["id"])
+            await task_service.update_fields_with_mode(
+                task, {"result_path": json.dumps({f"k{i}": f"/u/{i}"})}, mode="merge")
+
+        await asyncio.gather(*(one(i) for i in range(12)))
+
+    orm(dsn, go)
+    stored = json.loads(fetch(dsn, "SELECT result_path FROM tasks WHERE id=$1", t["id"])[0]["result_path"])
+    assert sorted(stored) == sorted(f"k{i}" for i in range(12))
+
+
+def test_child_admission_rejected_by_the_gate_fails_instead_of_running(client, dsn, types):
+    """闸门（参数 / 钩子 / 点数）若在子任务翻成 PENDING 之后才拒绝，被拒的子任务仍在池里、被 worker 领走执行。
+    现在先预检、后翻转：被拒的判失败，永远不进池。"""
+    from webx.lib.task_errors import ParamsError
+    from webx.models import Task
+    from webx.services.task import task_service
+
+    def deny(params):
+        raise ParamsError("bad child params")
+
+    types(TaskTypeSpec(name="kid_denied", validate_params=deny))
+    parent, kid = create(client, "adm"), create(client, "adm")
+    execute(dsn, "UPDATE tasks SET parent_id=$1, task_type='kid_denied', status='draft', auto_post=1 WHERE id=$2",
+            parent["id"], kid["id"])
+
+    async def go():
+        return await task_service._try_admit_child(await Task.get(id=kid["id"]))
+
+    assert orm(dsn, go) == "failed"
+    row = fetch(dsn, "SELECT status, auto_post, error_message FROM tasks WHERE id=$1", kid["id"])[0]
+    assert row["status"] == "failed" and row["auto_post"] == 0 and "bad child params" in row["error_message"]

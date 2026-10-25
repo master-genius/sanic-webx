@@ -114,6 +114,8 @@ def _expand_modules(modules: Iterable[str]) -> list[str]:
 
         <pkg>/controller/     必须有 —— 蓝图扫描的根
         <pkg>/i18n.py         可选   —— import 即注册文案（要的只是副作用）
+        <pkg>/tasks.py        可选   —— import 即登记任务类型与补偿器钩子（register_task_type /
+                                       register_sweep / register_failed_hook）。补偿器进程按同一约定加载
         <pkg>/models(.py|/)   可选   —— 交给 ORM 建表/查询
 
     这就是原先业务入口模块里那几行手写装配的去处：业务只管把目录摆成这个样子，
@@ -138,6 +140,10 @@ def _expand_modules(modules: Iterable[str]) -> list[str]:
         if module_exists(f"{mod}.i18n"):
             importlib.import_module(f"{mod}.i18n")
             logger.debug("已加载业务文案模块: %s.i18n", mod)
+
+        if module_exists(f"{mod}.tasks"):
+            importlib.import_module(f"{mod}.tasks")
+            logger.debug("已加载业务任务模块: %s.tasks", mod)
 
         ctrl = f"{mod}.controller"
         if not module_exists(ctrl):
