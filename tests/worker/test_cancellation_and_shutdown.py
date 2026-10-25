@@ -128,7 +128,7 @@ def test_self_fence_deadline_is_strictly_earlier_than_server_expiry():
 async def test_lease_expiry_while_server_unreachable_kills_the_child(harness, server, monkeypatch):
     """网络分区：续租持续失败，租约临期 → 自行终止子进程（浪费上界 = 租约时长）。"""
     monkeypatch.setattr(hb_mod, "_SELF_FENCE_MARGIN_SEC", 0.0)
-    server.heartbeat_lease_seconds = 1.0           # 每次成功续租只给 1 秒
+    server.heartbeat_lease_seconds = 3.0           # 每次成功续租只给 3 秒（太短则满载机器上子进程还没起来租约就到期了）
     pidfile = harness.tmp / "pid2"
     harness.channel("hang", f"""
         import os, time
