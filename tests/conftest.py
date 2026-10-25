@@ -104,7 +104,8 @@ def app_with_db(tmp_path_factory):
     """
     from webx.core.app import create_app
 
-    db_url = f"sqlite://{tmp_path_factory.mktemp('e2e')}/e2e.db"
+    db_dir = tmp_path_factory.mktemp("e2e")
+    db_url = f"sqlite://{db_dir}/e2e.db"
 
     async def init_sqlite(sanic_app):
         # _enable_global_fallback 与 webx.core.db.init_db 同款：启动钩子跑在后台任务里、
@@ -129,6 +130,8 @@ def app_with_db(tmp_path_factory):
         on_startup=[init_sqlite],
         on_shutdown=[close_sqlite],
     )
+    # 暴露库文件路径：同步的 HTTP 用例不能直接跑 ORM，需要 stdlib sqlite3 改库时用
+    application.ctx.sqlite_path = db_dir / "e2e.db"
     try:
         yield application
     finally:

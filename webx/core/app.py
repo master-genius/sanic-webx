@@ -73,13 +73,38 @@ def _builtin_packages(spec: bool | Iterable[str]) -> list[str]:
         )
     if not known:
         logger.warning(
-            "⚠️ 内置路由组配置 %s 全部无效，回退为**全部加载**（保证服务可用）。"
-            "如确实不需要内置路由，请显式配置 false",
+            "⚠️ 内置路由组配置 %s 全部无效，回退为**全部加载**（%s，含 admin 管理端）。"
+            "只要部分组请写成逗号分隔的有效组名；确实不要内置路由，请显式配置 false",
             groups,
+            ",".join(BUILTIN_GROUPS),
         )
         return ["webx.controller"]
 
     return [f"webx.controller.{g}" for g in known]
+
+
+def _log_builtin_summary(builtin_packages: Iterable[str]) -> None:
+    """启动时明确报告「实际挂了哪些内置路由组」。
+
+    默认全挂是有意的，但「我以为只挂了 auth」与「实际全挂了」只有靠这一行才看得出来。
+    挂了 admin 组时多提一句：它带整套账号 CRUD 与权限管理端点。
+    """
+    pkgs = list(builtin_packages)
+    if not pkgs:
+        logger.info("内置路由组: 无（builtin_controller=False，纯业务服务）")
+        return
+
+    groups = (
+        list(BUILTIN_GROUPS)
+        if "webx.controller" in pkgs
+        else [p.rsplit(".", 1)[-1] for p in pkgs]
+    )
+    logger.info("内置路由组: %s", ",".join(groups))
+    if "admin" in groups:
+        logger.info(
+            "内置 admin 组已挂载（账号 CRUD、角色/权限管理，位于 /api/admin/*）。"
+            "不需要请设 WEBX_BUILTIN=auth,api,public 或 false"
+        )
 
 
 def _expand_modules(modules: Iterable[str]) -> list[str]:
@@ -235,6 +260,7 @@ def create_app(
     # 或 controller_package="app.controller" 与 modules=["app"] 并写。
     # 只归一化一次：重复调用会把无效组名的 WARNING 打印两遍
     builtin_packages = _builtin_packages(builtin_controller)
+    _log_builtin_summary(builtin_packages)
 
     # 模型模块一律按约定扫 <pkg>/models —— **webx 自己也走这套**，不搞特殊。
     # 挂了任何内置路由组就带上 webx.models（auth/api/admin 组都要查 User/Permission

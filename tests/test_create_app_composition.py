@@ -495,3 +495,30 @@ def test_startup_never_syncs_permissions_to_db(mkapp, monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_builtin_summary_is_logged(mkapp, caplog):
+    """启动必须明说「实际挂了哪些内置组」——默认全挂是有意的，提示是唯一的可见性。"""
+    with caplog.at_level("INFO"):
+        mkapp(None, modules=["app"], builtin_controller=True)
+    assert "内置路由组: auth,api,admin,public" in caplog.text
+    assert "admin 组已挂载" in caplog.text, "挂了 admin 要多提一句它带什么、怎么关"
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        mkapp(None, modules=["app"], builtin_controller=["auth", "api"])
+    assert "内置路由组: auth,api" in caplog.text
+    assert "admin 组已挂载" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        mkapp(None, modules=["app"], builtin_controller=False)
+    assert "内置路由组: 无" in caplog.text
+
+
+def test_all_invalid_builtin_groups_fallback_warning_is_explicit(mkapp, caplog):
+    """配错回退为全加载时，WARNING 要写明「实际挂了什么」，而不只是「无效」。"""
+    with caplog.at_level("WARNING"):
+        mkapp(None, modules=["app"], builtin_controller=["nope"])
+    assert "全部加载" in caplog.text
+    assert "auth,api,admin,public" in caplog.text and "admin" in caplog.text

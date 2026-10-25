@@ -184,18 +184,19 @@ async def logout(request: Request):
 async def refresh(request: Request):
     """刷新令牌（需有效令牌）。
 
-    管理员刷新时复查 forbid：管理端权限大，被封禁后不该靠旧令牌续命；
-    C 端不复查，省一次查库。
+    管理员与 C 端用户刷新时都复查账户存在性与 forbid：令牌是无状态的，
+    ``/refresh`` 是服务端唯一能拦住「被封禁账号靠旧令牌无限续命」的位置。
+    代价是每次刷新一次主键查询；刷新本就低频，不在热路径上。
     """
     lang = get_lang_from_header(request.headers)
     payload = request.ctx.token_payload
 
-    if payload.get("role") == "admin":
-        admin = await admin_service.get_by_id(payload.get("user_id"))
-        if not admin:
-            return json({"error": "账户不存在"}, status=401)
-        if admin.forbid:
-            return json({"error": "账户已被禁用"}, status=403)
+    service = admin_service if payload.get("role") == "admin" else user_service
+    account = await service.get_by_id(payload.get("user_id"))
+    if not account:
+        return json({"error": "账户不存在"}, status=401)
+    if account.forbid:
+        return json({"error": "账户已被禁用"}, status=403)
 
     new_token = get_token().make_token(payload, id_=payload.get("__tokenId__"))
     return json(

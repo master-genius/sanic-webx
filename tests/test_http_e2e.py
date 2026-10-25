@@ -177,6 +177,69 @@ def test_logout_and_refresh(http_app, captured_codes_module):
     assert refreshed.json["data"]["token"]
 
 
+# ---- /auth/refresh 复查账户状态 ----
+# 令牌是无状态的，refresh 是服务端唯一能拦住「被封禁账号无限续命」的位置。
+# HTTP 夹具是同步的、不能在测试里直接跑 ORM，故用 stdlib sqlite3 直接改库。
+
+
+def _e2e_db(app):
+    import sqlite3
+
+    return sqlite3.connect(app.ctx.sqlite_path)
+
+
+def _refresh(app, token):
+    return app.test_client.post(
+        "/auth/refresh", headers={"Authorization": f"Bearer {token}"}
+    )[1]
+
+
+def test_refresh_rejects_forbidden_user(http_app, captured_codes_module):
+    token = _login_token(http_app, captured_codes_module, "banned1", "banned1@example.com")
+    assert _refresh(http_app, token).status == 200  # 封禁前正常
+
+    with _e2e_db(http_app) as db:
+        db.execute("UPDATE user SET forbid=1 WHERE username='banned1'")
+
+    resp = _refresh(http_app, token)  # 令牌本身仍未过期，但不能再续命
+    assert resp.status == 403
+    assert "token" not in (resp.json.get("data") or {})
+
+
+def test_refresh_rejects_deleted_user(http_app, captured_codes_module):
+    token = _login_token(http_app, captured_codes_module, "gone1", "gone1@example.com")
+    with _e2e_db(http_app) as db:
+        db.execute("DELETE FROM user WHERE username='gone1'")
+    assert _refresh(http_app, token).status == 401
+
+
+def test_refresh_admin_branch_still_checks_account(http_app):
+    """admin 令牌走 Admin 表：不存在 → 401，被封 → 403，正常 → 200。"""
+    from webx.lib.token import get_token
+
+    def admin_token(uid):
+        return get_token().make_token(
+            {"user_id": uid, "username": uid, "role": "admin"}, id_="admin"
+        )
+
+    assert _refresh(http_app, admin_token("adm_none")).status == 401
+
+    cols = (
+        "id,username,mobile,mobile_state,email,email_state,realname,sex,info,passwd,"
+        "create_time,update_time,failed_count,failed_time,forbid,is_root,openid,unionid,extra"
+    )
+    with _e2e_db(http_app) as db:
+        for uid, forbid in (("adm_ok", 0), ("adm_ban", 1)):
+            db.execute(
+                f"INSERT INTO superadmin ({cols}) VALUES "
+                f"(?,?,'',0,'',0,'',0,'','x',0,0,0,0,?,0,'','','{{}}')",
+                (uid, uid, forbid),
+            )
+
+    assert _refresh(http_app, admin_token("adm_ok")).status == 200
+    assert _refresh(http_app, admin_token("adm_ban")).status == 403
+
+
 # ==================== 管理端 ====================
 
 
