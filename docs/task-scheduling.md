@@ -41,7 +41,8 @@ worker 自己用长连接来领。互斥只来自一条带条件的 `UPDATE`，�
 **为什么 grace 按"已投入"而不是"预计还要多久"**：误抢占的损失 = 接手方从当前步骤开头重跑 = 已投入时长；
 剩余时长不影响损失，所以也不需要任何耗时估算。
 
-**不变量**：`worker_id` 非空 ⟺ 持有租约 ⟺ 状态为 `queued`/`running`；`pending` 无租户；
+**不变量**：`pending` 无租户；`queued`/`running` 持有租约；终态与多阶段中间步（等用户追加参数）释放租约（`lease_until` 为空）
+但保留 `worker_id`（排查线索，也是 `already_final` 判别所需），释放后不得被迟到的心跳 / 归还复活；
 **任何路径把任务放回 `pending` 都必须 `lease_seq + 1`**（走 `lease.enter_pending_pool`），否则同一台 worker
 再次领到该任务时，第一次运行残留的在途回调会匹配通过并污染第二次运行。
 

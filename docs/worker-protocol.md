@@ -35,7 +35,7 @@
 
 | 情形 | 响应 |
 |---|---|
-| 任务不存在 / 已软删 | `403 {"ok": false, "reason": "gone"}` |
+| 任务不存在 / 已软删 | `403 {"ok": false, "reason": "gone"}`（经 fencing 校验的写端点）；`ack` 与 `DELETE /lease` 对不存在的任务回 `not_lessee`；读接口与心跳回 `404` |
 | 令牌不是当前租户（过期租户） | `403 {"ok": false, "reason": "not_lessee"}` |
 | 同一租户但任务已在终态 | `403 {"ok": false, "reason": "already_final"}` —— **这是幂等成功**，调用方视为成功后丢弃，不要告警 |
 | **完全没带令牌**（除 `DELETE /lease`） | `403 {"ok": false, "reason": "not_lessee"}`（无论任务当前有没有租户）|
@@ -213,17 +213,20 @@ worker 的产物上传到**存储服务**（见 `docs/storage-service.md`），�
 
 ## 6. 状态机
 
-状态：`draft → pending → queued → running → completed | failed | cancelled`。
+状态：`none → draft → pending → queued → running → completed | failed | cancelled`（`none` 是刚创建、尚无输入的空任务）。
 
 | 从 | 到 |
 |---|---|
+| `none` | `draft`, `none` |
 | `draft` | `pending`, `draft` |
 | `pending` | `queued`, `running`, `failed`, `cancelled` |
 | `queued` | `running`, `failed`, `cancelled` |
 | `running` | `completed`, `failed`, `cancelled`, `queued`（补偿器回收） |
 | 终态 | 无出边 |
 
-**租约不变式**：`worker_id` 非空 ⟺ 持有租约 ⟺ 状态为 `queued` 或 `running`。`pending` 无租户。
+**租约不变式**：`pending` 无租户（`worker_id=''`、`lease_until` 为空）；`queued` / `running` 持有租约；终态与“多阶段中间步等用户追加参数”
+**释放租约**（`lease_until` 为空）但**保留 `worker_id` 与 `lease_seq`**——前者是排查线索，后者与 `already_final` 的幂等判别依赖它。
+释放后的任务不能被迟到的心跳 / 归还复活（续租与归还的 SQL 都要求 `lease_until IS NOT NULL`）。
 **任何路径把任务放回 `pending`，都必须 `lease_seq + 1`**，并戳醒领取服务。
 
 ## 7. worker 必须遵守的行为

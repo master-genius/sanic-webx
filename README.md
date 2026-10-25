@@ -170,7 +170,7 @@ python run.py --dev                       # 开发：单进程，好断点
 
 ```bash
 ./server.sh --no-builtin             # 纯业务服务，零内置端点
-./server.sh --builtin auth,api       # 只要登录与用户/文件，不要 admin 后台
+./server.sh --builtin auth,api,public  # 只要登录、用户/文件与签名下载；不要 admin 后台，也没有任务回调（internal）
 ```
 
 `WEBX_BUILTIN` 的取值语义——**只有显式 `false` 才不加载**：
@@ -483,14 +483,16 @@ curl -H "Authorization: Bearer $T" -F file=@big.zip /api/files/mybucket
 # 分片上传：init → 逐片 PATCH → complete
 curl -X POST -H "Authorization: Bearer $T" -d '{"filename":"big.zip","total":10485760}' \
      /api/files/mybucket/uploads
-curl -X PATCH -H "Upload-Offset: 0" --data-binary @part0 /api/uploads/$UID
-curl -X POST /api/uploads/$UID/complete
+# （UP 是上一步响应里的 upload_id；别用 $UID——那是 bash 的只读变量，值是你的用户数字 ID）
+curl -X PATCH -H "Authorization: Bearer $T" -H "Upload-Offset: 0" --data-binary @part0 /api/uploads/$UP
+curl -X POST -H "Authorization: Bearer $T" /api/uploads/$UP/complete
 
 # 下载（流式 + Range 断点续传）
 curl -H "Range: bytes=0-1023" /api/files/mybucket/big.zip
 
 # 签发限时链接 → 无需登录即可下载
-curl -X POST -d '{"ttl_seconds":600}' /api/files/mybucket/big.zip/signatures
+curl -X POST -H "Authorization: Bearer $T" -d '{"ttl_seconds":600}' /api/files/mybucket/big.zip/signatures
+# ⚠️ 需要先配置 STORAGE_SIGN_SECRET，否则签名功能 fail-closed（503）。tasks/ 开头的 bucket 属于任务模块，通用文件接口一律 403
 ```
 
 三条从生产事故换来的约束，改动前先读懂：
@@ -557,23 +559,19 @@ register_permissions({
 .venv/bin/python -m pytest tests/ -q
 ```
 
-143 个用例，八层覆盖：
+约 1000 个用例。认领 / 租约的 SQL 是 PostgreSQL 专有的，**这部分用例连真实 PG**（获取方式见 `docs/testing.md`，
+拿不到时是失败而不是跳过）；账号 / 权限 / 文件那部分仍用 sqlite 内存库。完整的验证过程见 `docs/verification.md`。
 
-| 文件 | 覆盖 |
-|---|---|
-| `test_smoke.py` | 装配/路由/中间件链/令牌/异常渲染（"硬编码路径已拔干净"的验收） |
-| `test_rbac.py` | 权限判定逻辑（纯函数，不查库） |
-| `test_auth_db.py` | 注册登录锁定、验证码三层防刷与状态流转（真查库） |
-| `test_rbac_db.py` | `role_perm_middleware` 三表查询、权限同步与清理、单独授权（真查库） |
+| 层 | 文件 | 覆盖 |
+|---|---|---|
+| 框架 | `test_smoke.py` `test_layering.py` `test_create_app_composition.py` | 装配 / 路由 / 中间件链 / 令牌 / 异常渲染；包级依赖无环且自上而下、核心不依赖兄弟包、worker 完全独立 |
+| 账号权限 | `test_rbac*.py` `test_auth_db.py` `test_sms.py` `test_mail.py` `test_cli.py` | 权限判定、注册登录锁定、验证码防刷、短信适配层、发件人、命令行工具 |
+| 文件 | `test_storage.py` `test_chunked_upload.py` `test_http_e2e.py` `test_storage_service.py` `test_storage_live.py` `test_audit_storage.py` | 路径穿越、原子落位、Range、分片续传与竞争、签名 fail-closed；独立存储服务（含真进程）；通用文件接口不得触碰 `tasks/` |
+| 任务（真 PG） | `test_task_core.py` `test_task_lease.py` `test_reconciler.py` `test_task_server.py` `test_task_api.py` `test_task_internal_api.py` | 类型注册表与配额、认领互斥与 fencing、补偿器、领取服务、用户 / worker 接口 |
+| worker | `tests/worker/` | 领取 / 租约 / 取消 / 停机 / 恢复 / 上传 / 日志脱敏，对着协议替身 |
+| **整栈** | `test_stack_e2e.py` | 五个独立进程拼起来：正常完成、失败、取消、优雅停机回池、`kill -9` 后补偿器回收 |
 
-| `test_http_e2e.py` | 真起应用跑完整 HTTP 链路：发码 → 注册 → 登录 → 个人中心 → 管理端鉴权 |
-| `test_layering.py` | 包级依赖必须无环且自上而下（AST 扫描全部 import） |
-| `test_storage.py` | 路径穿越、原子落位、Range 三态、签名防挪用 |
-| `test_chunked_upload.py` | 分片上传：offset 冲突自愈、不完整不落位、会话回收 |
-| `test_cli.py` | 命令行工具：建账号事务性、组织解析、权限初始化（真查库） |
-
-查库测试用 sqlite 内存/文件库，不需要本地起 PostgreSQL。**框架代码不为测试做任何让步**——
-夹具直接 `Tortoise.init(db_url="sqlite://...")`，绕开只面向 PG 的 `tortoise_config()`。
+框架代码不为测试做任何让步：账号权限类夹具直接 `Tortoise.init(db_url="sqlite://...")`，绕开只面向 PG 的 `tortoise_config()`。
 
 `schema_sync` 是从 deepmice-api 逐字搬运的（仅改 docstring 路径字样，无逻辑改动），
 已在真实项目中长期验证，此处不再重复覆盖。

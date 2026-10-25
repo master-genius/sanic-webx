@@ -35,10 +35,10 @@ sudo apt-get update && sudo apt-get install -y python3.13 python3.13-venv
 curl -LsSf https://astral.sh/uv/install.sh | sh        # 若用 uv；有 .venv 就不需要
 
 cd /opt/webx
-uv sync                                                  # 或：python3.13 -m venv .venv && .venv/bin/pip install .
+uv sync                                                  # 本仓库不做成安装包，依赖由 pyproject.toml 声明；没有 uv 时：uv venv && uv pip install --python .venv/bin/python -r pyproject.toml
 ```
 
-`server.sh` 选解释器的顺序是 **`.venv/bin/python` → `uv run` → 系统 `python3`**；systemd 的极简 `PATH` 里没有
+`server.sh` 选解释器的顺序是 **`$WEBX_PYTHON`（显式指定）→ `.venv/bin/python` → `uv run` → 系统 `python3`**；systemd 的极简 `PATH` 里没有
 `~/.local/bin`，用 uv 时会自己探测常见安装目录，也可在单元里设 `Environment=UV_BIN=/abs/path/to/uv`。
 
 ### 2. 配置
@@ -53,7 +53,7 @@ cp .env.example .env && vim .env
 |---|---|
 | `DATABASE_HOST / PORT / NAME / USER / PASSWORD` | PostgreSQL。**数据库钉死 PostgreSQL**：认领 / 租约的 SQL 用 `FOR UPDATE SKIP LOCKED`，不支持其它库 |
 | `TOKEN_SECRET` | 用户令牌（AES-256-GCM）主密钥。**<16 字符直接抛异常**，默认值 `change-me-in-production` 绝不能上线 |
-| `STORAGE_SIGN_SECRET` | 下载签名密钥，独立于 `TOKEN_SECRET` 以便单独轮换；留空会回落并告警 |
+| `STORAGE_SIGN_SECRET` | 下载签名密钥，独立于 `TOKEN_SECRET` 以便单独轮换。**必须配置**：留空时回落 `TOKEN_SECRET`，而它仍是默认值（或过短）时签名功能 **fail-closed**——拒绝签发（503）、校验一律无效 |
 | `INTERNAL_TOKEN` | 服务间令牌。**未配置则 internal 组与存储的 `/internal` 拒绝一切请求**（空配置绝不等价于放行）。必须与每台 worker 的 `WEBX_WORKER_INTERNAL_TOKEN` **逐字一致**，否则回调全 401 |
 | `APP_ENV` | 生产设 `prod`。留 `dev` 等于 CORS 对全网放行 |
 | `TASK_SERVER_URL` | web / 补偿器“戳醒”领取服务的地址（同机默认 `http://127.0.0.1:9020`） |
@@ -82,6 +82,9 @@ python tools/org.py init-perm --org 默认组织
 ### 4. 安装单元并启动
 
 单元文件里的 `WorkingDirectory` / `ExecStart` / `User` 写死为 `/opt/webx` 与 `www-data`，**路径或运行用户不同就先改**。
+
+> ⚠️ `webx-web.service` 带 `Wants=webx-task.service webx-reconciler.service`（单机部署时让它们一起起来）。**把 web 部署到第二台机器时
+> 去掉这一行**，否则那台机器也会拉起一个领取服务和一个补偿器，违反下面的“task 必须单进程、reconciler 全局只能一份”。
 
 ```bash
 sudo cp deploy/systemd/webx-*.service /etc/systemd/system/
@@ -119,7 +122,7 @@ sudo systemctl enable --now webx-storage
 ```
 
 关键配置（`.env`，存储服务读同一份或自己的）：`STORAGE_PORT`（默认 9010）、`STORAGE_DIR`、`STORAGE_WORKERS`、
-`STORAGE_INTERNAL_TOKEN`（缺省回落 `INTERNAL_TOKEN`）、`STORAGE_POLICIES`（默认 `task_results`）。
+`STORAGE_INTERNAL_TOKEN`（缺省回落 `INTERNAL_TOKEN`；**单独配置了它，下面的 `verify --token` 就要用它而不是 `INTERNAL_TOKEN`**）、`STORAGE_POLICIES`（默认 `task_results`）。
 **保留期清理默认不随存储启动**，也不应挂在多 worker 的应用里（每个 worker 各跑一份会互相删对方正在检查的东西）：
 需要时单独跑 `python -m webx_storage retention --dry-run` / `--once`，见 `docs/storage-service.md`。
 
@@ -208,7 +211,7 @@ python -m webx_worker service multi --help                                   # �
 |---|---|---|---|
 | 1 | 领取服务可达、鉴权、数据库 | `python -m task_server verify --url http://127.0.0.1:9020 --token <INTERNAL_TOKEN>` | 退出码 0，逐项 ✓。不改数据 |
 | 2 | 存储服务的对象 / 分片 / 签名全链路 | `python -m webx_storage verify --url http://127.0.0.1:9010 --token <INTERNAL_TOKEN>` | 退出码 0 |
-| 3 | worker 的配置、脚本、令牌、三个通道 | `python -m webx_worker doctor --home <worker 主目录>` | 退出码 0（1 = 有失败，2 = 配置不可用） |
+| 3 | worker 的配置、脚本、令牌、三个通道 | `python -m webx_worker doctor --home <worker 主目录>` | 退出码 0；非 0 = 有失败（含配置缺失、连不上） |
 | 4 | **整条链路**：提交 → 领取 → 执行 → 回调 → 完成 → 产物可下载 | `python tools/smoke.py --web https://api.example.com --login 用户:密码 --storage https://files.example.com` | 退出码 0，末行 `✅ 全链路通` |
 
 第 4 步会在线上创建一个真实任务（默认类型 `demo`，睡一秒、写两个文件，不碰业务；结束后删除），需要有至少一台跑着 `demo`
@@ -223,10 +226,10 @@ channel 的 worker——`webx_worker/examples/` 里就是现成的最小配置�
 
 | 现象 | 先查 |
 |---|---|
-| 任务一直 `pending`，没有任何报错 | 领取通道：反代是否转发了 `/task/leases`；worker 的 `TASK_SERVER_URL`；worker 日志里有没有 `404 ← .../task/leases`；`doctor` 第“领取通道”项 |
+| 任务一直 `pending`，没有任何报错 | 领取通道：反代是否转发了 `/task/leases`；worker 的 `WEBX_WORKER_TASK_SERVER_URL`；worker 日志里有没有 `404 ← .../task/leases`；`doctor` 第“领取通道”项 |
 | worker 领到了任务但一直 `queued`，随后被回收重投 | `ack` 失败：worker 到 web 的回调通道（`INTERNAL_TOKEN` 不一致 = 401，反代没放行 `/internal/`）；`doctor` 第“回调通道”项 |
 | 任务反复被回收，最终 `failed`，错误里写着“连续 N 次被回收” | worker 心跳没到达（网络 / 反代超时），或任务本身让 worker 崩溃；看 worker 日志与 `LEASE_REQUEUE_LIMIT` |
-| 任务做完了但 `result_path` 为空 | 存储通道：worker 的 `STORAGE_URL` / 令牌；`doctor` 的存储项；worker 工作目录里 `ok.json` 的 `server_confirmed` |
+| 任务做完了但 `result_path` 为空 | 存储通道：worker 的 `WEBX_WORKER_STORAGE_URL` / 令牌；`doctor` 的存储项；worker 工作目录里 `ok.json` 的 `server_confirmed` |
 | 所有受权限保护的端点 403 | 没跑 `tools/org.py init-perm` |
 | 服务起来了但接口报 `column does not exist` / `no such table` | 没跑 `tools/dbsync.py`，或 `dbsync` 的 `--modules` 与服务的 `WEBX_MODULES` 不一致 |
 | 改了 `.env` 不生效 | 单元的 `ExecStart` 是否写了参数；补偿器启动日志那一行打印的才是生效值 |

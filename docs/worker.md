@@ -425,6 +425,19 @@ python -m webx_worker doctor --home /srv/worker --config gpu0
 | K14 | 非空 `LANES` 漏写的 channel 只打 WARNING，不会被领取（刻意不顺手补） |
 | K15 | `WEBX_WORKER_HEARTBEAT_INTERVAL` 为已废弃的占位配置，不生效 |
 
+**独立审计（2026-10）新记录、未修的**：
+
+| # | 内容 |
+|---|---|
+| K16 | **磁盘无上限增长**：`cleanup` 默认策略不含 `cancelled`（被吊销 / 自熔 / 被抢走租约后写的 ok.json），`failed, server_confirmed=false` 的目录被规则 4 跳过且 recovery 不重试 failed；`complete` 入队后由 PendingReporter 重试成功时没有地方把 ok.json 标记为已确认（只有重启 recovery 会修正）；日志只滚动不清理 |
+| K17 | uploader 队列同名条目（`{task}__{slug}.json`）被新条目覆盖后，旧条目上传完成时的 `drop()` 会把新条目一起删掉（用户 redo 同一步时，新产物永远不会交付） |
+| K18 | 分片上传遇 `409` 且响应缺 `Upload-Offset` 头（反代吞头）时按 offset=0 无限重发 8MB 分片，没有计数与退避 |
+| K19 | `--log DIR` 只存在局部变量，没回写 `worker_settings.LOG_DIR`，uploader 子进程的日志被丢弃 |
+| K20 | uploader 崩溃重启的退避只增不减（注释说“活过一段时间会重置”，代码没有） |
+| K21 | `cleanup` 可能在新一轮起点（旧 ok.json 要到 ack 与上报 running 之后才删）与新一轮并发，窗口内会 rmtree 多步任务上一步的中间产物 |
+| K22 | 空领取（HTTP 200 空列表）立即重连没有最小间隔；服务端 HOLD 配成 0 或代理返回静态 200 JSON 时是紧循环 |
+| K23 | `executor.py` 里 `work_base_dir / task_id`、`run_{sub_step}.log` 未做路径名归一化。服务端只有内部 `PATCH /steps`（DTO 限 30 字符）能写 `sub_step`，要先拿下任务脚本才能利用，属纵深防御缺口，与 K12 同类 |
+
 ## 15. 与旧实现的对照（迁移说明）
 
 - **合并**：`executor.py` + `executor_o.py` → 唯一一份 `executor.py`（`asyncio.wait(timeout=)` 在 3.10/3.11+ 通用）。

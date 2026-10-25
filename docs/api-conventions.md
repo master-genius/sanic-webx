@@ -20,7 +20,7 @@
    ✗ `DELETE /files/delete/<id>`　✓ `DELETE /files/<id>`
 
 3. **无法映射成 CRUD 的状态迁移，才把动作名放在子路径**：`POST /<资源>/<id>/<动词>`，
-   如 `/tasks/<id>/cancel`、`/uploads/<id>/complete`、`/leases/<id>/release`。
+   如 `/tasks/<id>/cancel`、`/uploads/<id>/complete`。（租约归还没有用 `/leases/<id>/release`，而是 `DELETE /internal/tasks/<id>/lease`——它是对租约这个名词的删除，可以映射成 CRUD。）
    判断标准：它是对已有资源的一次**状态变化**，且没有合适的名词能代替。
 
 4. **批量操作用名词化的子资源**，而不是动词：`POST /results/deletions`（创建一次删除请求）、
@@ -34,7 +34,8 @@
 
 7. **状态码**：创建 `201`；成功 `200`；参数错误 `400`；未认证 `401`；无权限 `403`；
    不存在 `404`；冲突 `409`；过大 `413`；限流 `429`；上游故障 `502`。
-   **公开端点对"无权访问"也回 `404`**，不泄露资源是否存在。
+   **公开端点对"无权访问"也回 `404`**，不泄露资源是否存在。例外：任务产物的公开读取（`/public/tasks/<id>/results/...`）
+   签名无效回 `403`，见 `storage-service.md`。
 
 8. **错误体**统一 `{"error": "<说明>"}`；需要机器可读原因时加 `code` / `reason`。
 
@@ -81,12 +82,17 @@
 | `POST /auth/login` `/auth/admin-login` `/auth/logout` `/auth/refresh` `/auth/register` | 按规则 5 应建模为 `POST /auth/sessions`、`DELETE /auth/sessions`、`POST /accounts` | 登录 / 注册 / 登出是几乎所有前端与第三方都按字面写死的路径，且鉴权中间件的白名单、限流、审计都按路径配置；收益只是风格，风险是全站登录失效 | 若要改，随一次大版本一起做，旧路径别名保留一个完整版本周期 |
 | `POST /auth/verifycode` `/auth/verifycode-login` `/auth/account/change-by-code` | 路径里带动作（`change-by-code` 最重） | 同上，且 `change-by-code` 同时承载找回密码与换绑，拆分需要业务确认 | 同上 |
 | `POST /api/user/{email,mobile}/bind` `/unbind` `/bind/code` | `bind` 应为 `PUT /api/user/email`；`unbind` 应为 `DELETE /api/user/email` | 解绑要求在请求体里带当前密码，而 `DELETE` 带请求体会被不少网关丢弃（规则 4）；只改 bind 不改 unbind 会把成对接口拆成两种风格 | 改成 `PUT` + “解绑 = `POST /api/user/email/removals`（名词化）”前先确认前端 |
-| `DELETE /internal/tasks/<task_id>`（存储服务） | 语义是“删除该任务的全部产物”，路径却只有任务 id，与 Web 服务里的 `/internal/tasks/<id>` 同形不同义 | 这是旧存储契约的兼容路径，调用方（`storage_client.delete_results`）已固定 | 新调用方用 `POST /internal/tasks/<id>/results/deletions` |
+| `DELETE /internal/tasks/<task_id>`（存储服务） | 语义是“删除该任务的全部产物”，路径却只有任务 id，与 Web 服务里的 `/internal/tasks/<id>` 同形不同义 | 这是旧存储契约的兼容路径，调用方（`storage_client.delete_task`）已固定 | 新调用方用 `POST /internal/tasks/<id>/results/deletions` |
 | `PUT /api/tasks/<id>/info` 与 `PATCH /api/tasks/<id>` | 两条编辑路径容易混淆 | `info` 只改展示用基本信息，`PATCH` 改参数并推进状态机，权限与副作用不同 | 文档里已区分；如需合并，先统一副作用模型 |
 | `GET /`、`GET /health` | 无 | 约定俗成的探活路径 | — |
 
-### 仍存在的别名（均在存储服务，已在 `storage-service.md` 列出对照表）
+### 仍存在的别名
 
-`/internal/objects/upload`、`/internal/sign`、`/internal/tasks/<id>/results/{upload,upload/init,deletes}`、
-`/public/tasks/<id>/results[/<file>]`。它们让既有 worker / 前端的上传契约无需改动即可对接，同样只转发。
+**存储服务**（已在 `storage-service.md` 列出对照表）：`/internal/objects/upload`、`/internal/sign`、
+`/internal/tasks/<id>/results/{upload,upload/init,deletes}`。它们让既有 worker 的上传契约无需改动即可对接，只转发，
+响应带 `Deprecation` 与 `Link`（`{task_id}` 等占位符按本次请求的路径参数展开）。
+
+**Web 服务**：`POST /api/files/<b>/<f>/sign`、`/api/files/uploads/<id>[/complete]`、`POST /api/admin/account/<id>/passwd`，见上表“本次已改”。
+
+`/public/tasks/<id>/results[/<file>]` **不是别名**，是任务产物策略直接注册的规范公开路由。
 

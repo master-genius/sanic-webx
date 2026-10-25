@@ -34,14 +34,14 @@ python -m webx_storage verify --url http://127.0.0.1:9010 --token "$STORAGE_INTE
 | `STORAGE_DIR` | `storage` | 存储根目录 |
 | `STORAGE_HOST` / `STORAGE_PORT` / `STORAGE_WORKERS` | `0.0.0.0` / `9010` / `1` | 监听 |
 | `STORAGE_INTERNAL_TOKEN` | 回退 `INTERNAL_TOKEN` | 服务间令牌。**都为空则拒绝一切内部请求** |
-| `STORAGE_SIGN_SECRET` | 回退 `TOKEN_SECRET`（并告警） | 签名密钥，建议独立配置以便轮换 |
+| `STORAGE_SIGN_SECRET` | 回退 `TOKEN_SECRET`（并告警） | 签名密钥，建议独立配置以便轮换。**回退到空 / 默认值 `change-me-in-production` / 过短的 `TOKEN_SECRET` 时 fail-closed**：签发回 `503`，校验一律判无效（默认值是公开的，等于任何人都能自己签） |
 | `STORAGE_SIGN_TTL_SECONDS` | `3600` | 签名默认有效期 |
 | `STORAGE_POLICIES` | `task_results` | 启用的键策略，逗号分隔；置空 = 只提供通用接口 |
 | `STORAGE_KEY_RULE` | `lenient` | `strict` / `lenient`，见下 |
 | `UPLOAD_MAX_SIZE` | 2 GiB | 整传上限（回退 `STORAGE_REQUEST_MAX_SIZE`），更大的走分片 |
 | `UPLOAD_CHUNK_MAX_BYTES` | 64 MiB | 单个分片上限 |
 | `UPLOAD_SESSION_MAX_AGE_HOURS` | 24 | 未完成的分片会话存活上限，启动时回收 |
-| `STORAGE_RETENTION_*` | 关闭 | 保留期清理，见下 |
+| `STORAGE_RETENTION_ENABLED` / `_DAYS` / `_INTERVAL_HOURS` / `_MAX_PER_ROUND` | `false` / `90` / `6` / `500` | 保留期清理，见下 |
 
 ## API
 
@@ -148,7 +148,7 @@ register_policy("avatars", Avatars)             # 然后 STORAGE_POLICIES=task_r
 策略名写错会**启动即失败**（它决定对外暴露哪些路由，悄悄少一组比报错更难排查）。
 下载名拼法等任务相关细节，继承 `TaskResultsPolicy` 覆盖 `download_name` 即可，不要改内核。
 
-## 保留期清理（可选，默认关闭）
+## 保留期清理（可选，常驻循环默认关闭）
 
 ```bash
 python -m webx_storage retention --dry-run     # 只列出将删除的条目
@@ -156,6 +156,8 @@ python -m webx_storage retention --once        # 跑一轮
 STORAGE_RETENTION_ENABLED=true python -m webx_storage retention   # 常驻循环
 ```
 
+- ⚠️ `ENABLED` 只管**常驻循环**。`--once` / `--dry-run` 是手动执行，**不看 `ENABLED`**，`--once` 会真实删除。
+  `STORAGE_RETENTION_DAYS <= 0` 对所有模式一律拒绝（`<= 0` 等于“所有对象都已过期”）。
 - **独立进程**，不挂在应用里：存储服务多 worker 运行，应用内的后台任务会每个 worker 各跑一份，
   互相删对方正在检查的东西。
 - 判据是目录树里**最新的 mtime**（还在被追加产物的任务不会被删）；只管辖策略声明的范围
@@ -163,7 +165,7 @@ STORAGE_RETENTION_ENABLED=true python -m webx_storage retention   # 常驻循环
 - 单轮上限 `STORAGE_RETENTION_MAX_PER_ROUND`，一次配置失误删不空整个存储。
 - `RetentionPolicy.confirm()` 是删前确认钩子。"该不该留"的权威方（通常是主站，它有容量、
   用量、购买时长）接进来后必须守住：**权威方不可达时绝不删**——查不到 ≠ 不存在，删除不可逆。
-  纯 mtime 只是兜底，别把它当权威。
+  纯 mtime 只是兜底，别把它当权威。**仓库里没有任何 `confirm` 的真实实现**，“权威方不可达绝不删”目前只是约定。
 
 ## 验证
 
@@ -190,3 +192,11 @@ STORAGE_RETENTION_ENABLED=true python -m webx_storage retention   # 常驻循环
 - [ ] 反代对 `/internal` 做了来源限制（内部令牌是最后一道，不是唯一一道）
 - [ ] `verify` 通过
 - [ ] 保留期清理：确认没有意外启用（默认关闭；开启前先 `--dry-run`）
+
+## 已知限制（审计记录，未修）
+
+- 分片会话的 `PATCH` 不受创建时声明的 `total` 约束（可以超出，只有 `complete` 时才发现并 400，且无法截断，只能 abort）；
+  没有单会话总大小上限；`complete` 不幂等（成功后重试得到 404，丢了响应的客户端无法确认是否成功）。
+- 对象落位时若并发的 `DELETE` 恰好修剪掉刚建好的空目录，会重试一次；仍失败则回 `409`（上传需重传）。
+- `delete` / `delete_prefix` 把文件系统 `OSError` 吞成 `deleted:false`，与“对象本来就不存在”无法区分。
+- 文件名 / 键规则：**文件名一律不得含 `/` 或 `\`**（所有路由统一 400，不再“只留末段”）；`strict`/`lenient` 规则用 `\A…\Z` 匹配，末尾换行不放行。

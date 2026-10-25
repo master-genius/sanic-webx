@@ -1,5 +1,5 @@
 # 本仓库**不做成安装包**：拉下来就是项目，直接在里面开发。
-# pyproject 只用来声明第三方依赖（uv sync / pip install -r 都能用）与测试配置。
+# pyproject 只用来声明第三方依赖（用 `uv sync`；没有 uv 时 `uv pip install -r pyproject.toml`）与测试配置。
 
 [project]
 name = "webx"

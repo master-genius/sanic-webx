@@ -26,7 +26,8 @@ PostgreSQL 怎么获取见 `docs/testing.md`。认领 / 租约的 SQL 是 PG 专
 **webx 核心不依赖 `webx_storage` / `webx_worker`**；**`webx_worker` 完全独立**（只许标准库 + httpx + 自己，不 import webx 的任何东西，
 这样它才能单独打包发给算力节点 / 普通用户）。
 
-另有一条硬约束：代码、文档、环境变量里**不得出现旧项目名**（`tests/worker/test_docs_and_hygiene.py` 守着）。
+另有一条硬约束：代码、文档、环境变量里**不得出现旧项目名**。`tests/worker/test_docs_and_hygiene.py` 只扫 `webx_worker/`、`tests/worker/` 与 `docs/worker*.md`；
+全仓库范围请用 `grep -rniE '<旧项目名>' --exclude-dir=.git --exclude-dir=.venv .`（发布前手动跑一次）。
 
 ## ② 关键不变量与守护它们的用例
 
@@ -83,7 +84,7 @@ PostgreSQL 怎么获取见 `docs/testing.md`。认领 / 租约的 SQL 是 PG 专
 python -m task_server verify --url http://127.0.0.1:9020 --token $INTERNAL_TOKEN
 
 # 2. 存储服务：对象 / 分片 / 签名全链路
-python -m webx_storage verify --url http://127.0.0.1:9010 --token $INTERNAL_TOKEN
+python -m webx_storage verify --url http://127.0.0.1:9010 --token $STORAGE_INTERNAL_TOKEN   # 没单独配时即 INTERNAL_TOKEN
 
 # 3. worker：channel 配置、脚本、令牌、领取 / 回调 / 存储三个通道（在 worker 机器上跑）
 python -m webx_worker doctor --home /data/worker
@@ -92,7 +93,8 @@ python -m webx_worker doctor --home /data/worker
 python tools/smoke.py --web https://api.example.com --login 用户:密码 --storage https://files.example.com
 ```
 
-退出码约定：`0` 通过；`1` 有检查失败；`2` 前置条件不满足（连不上、登录失败、配置不可用）。
+退出码约定：`0` 通过；非 0 失败。`task_server verify` / `webx_storage verify` / `smoke` 用 `1` 表示有检查失败、`2` 表示前置条件不满足（连不上、登录失败）；
+`webx_worker doctor` 只有 `0` / `1`（配置缺失、连不上也是 1）。
 各项失败时的排查入口见 `deploy/README.md` 的“故障对照”。
 
 ### 它们各自能发现什么
@@ -118,3 +120,20 @@ python tools/smoke.py --web https://api.example.com --login 用户:密码 --stor
 - **uploader 异步上传进程**：整栈里关闭了（`UPLOADER_ENABLED=false`，示例任务的产物小于阈值，同步上传）；
   它的行为由 `tests/worker/test_uploader*.py` 覆盖，与服务端的联调只到协议替身。
 - **阿里云短信签名**：`webx/lib/sms` 的签名算法没有对着真实服务商验证过（只有适配层和假发送器的测试）。
+
+## 审计遗留（独立审查发现、评估后未修，如实记录）
+
+2026-10 的一轮独立审查（调度 / HTTP / 存储 / worker / 文档五个方向，复现后才修）里，下面这些**没有修**：
+
+| 项 | 为什么没修 | 影响与缓解 |
+|---|---|---|
+| 并发 / 每日创建 / 等待父任务三道配额闸是 check-then-act | 修法要对用户行加锁（`pg_advisory_xact_lock`）并把“计数 + 翻转状态”放进同一事务，改动面大；当前没有计费，配额是软限制 | 同一用户并发提交可击穿并发上限（实测 8 个草稿并发提交全部通过）。上线计费前必须补 |
+| 慢扫描用应用时钟（`reconciler.py`） | 阈值都是 60 分钟以上，时钟偏移的实际影响很小 | 与“所有租约运算用数据库 `now()`”的铁律不一致，仅限慢扫描 |
+| 心跳在“读到写之间被取消”时回包的 `status` 是读入时的值 | 最坏多撑一个心跳节拍 | 取消的传播延迟上界 = 一个心跳间隔 |
+| 分片 `PATCH` 不受 `total` 约束 / `complete` 不幂等 / `delete` 吞 `OSError` | 见 `storage-service.md` 的“已知限制” | 不影响数据正确性，影响可诊断性 |
+| 任务产物没有 `confirm` 权威方的真实实现 | 需要主站配合定义“该不该留” | 保留期清理默认关闭；开启前必须接权威方，否则只是纯 mtime |
+| worker 的 K16–K23 | 见 `worker.md` §14 | 磁盘增长、uploader 竞态等，均为可恢复或纵深防御 |
+| 阿里云短信签名没对真实服务商验证 | 需要真实账号 | 手机号登录在生产启用前需联调 |
+
+审查报告里 **CONFIRMED 的高危与中危项已全部修复并带回归用例**；每项修复都做过变异验证（改坏防线、确认用例转红、还原），
+记录在对应提交说明里。

@@ -3,14 +3,14 @@
 ```bash
 uv sync --extra dev
 .venv/bin/python -m pytest -q          # 全量
-.venv/bin/python -m pyflakes webx webx_storage task_server tools tests app run.py
+.venv/bin/python -m pyflakes webx webx_storage webx_worker task_server tools tests app run.py
 ```
 
 ## 需要 PostgreSQL 的测试
 
 认领 / 租约的 SQL 是 PG 专有的（`FOR UPDATE SKIP LOCKED`、`now()`、`EXTRACT(EPOCH ...)`），sqlite 测不了，
 而它们恰恰是全系统互斥性的来源，所以**不 mock 数据库**。涉及：`test_task_lease.py`、`test_reconciler.py`、
-`test_task_server.py`。获取 PG 的方式，按优先级：
+`test_task_server.py`、`test_task_api.py`、`test_task_internal_api.py`、`test_stack_e2e.py`。获取 PG 的方式，按优先级：
 
 1. **你已有的实例**：`WEBX_TEST_PG_URL=postgres://user:pass@host:port/dbname`（库需为空，测试会建表并清空数据）。
 2. **嵌入式 PG**（不需要 root 服务、不动系统）：

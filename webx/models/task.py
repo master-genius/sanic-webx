@@ -122,7 +122,7 @@ class Task(Model):
 
     # ==================== 任务归属（租约） ====================
     # 本组三字段共同表达"这个任务现在归谁、归到什么时候、这是第几次归属"。核心不变量：
-    #   worker_id 非空 ⟺ 持有租约 ⟺ status ∈ {QUEUED, RUNNING}
+    #   status ∈ {QUEUED, RUNNING} ⟹ 持有租约；终态与多阶段中间步释放租约（lease_until=NULL）但保留 worker_id
     #   status = PENDING ⟹ worker_id = '' 且 lease_until = NULL（公共池，无租户）
     #   任何路径 → PENDING ⟹ lease_seq += 1
     worker_id = fields.CharField(max_length=64, default="", index=True, description="当前 / 最近持有本任务的 worker 实例")
