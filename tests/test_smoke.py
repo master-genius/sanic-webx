@@ -136,7 +136,7 @@ def test_builtin_groups_can_be_selected():
         "webx.controller.auth",
         "webx.controller.admin",
     ]
-    assert set(BUILTIN_GROUPS) == {"auth", "api", "admin", "public"}
+    assert set(BUILTIN_GROUPS) == {"auth", "api", "admin", "public", "internal"}
 
 
 def test_unknown_builtin_group_is_dropped_with_warning(caplog):

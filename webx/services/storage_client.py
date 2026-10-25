@@ -55,3 +55,24 @@ def delete_task_background(task_id: str) -> None:
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     except RuntimeError:
         pass  # 无运行中的事件循环：存储侧的保留期清理会兜底
+
+
+async def delete_results(task_id: str, urls: list[str]) -> bool:
+    """按下载 URL 批量删除某任务在存储服务上的结果文件
+    （``POST /internal/tasks/<id>/results/deletions``，幂等、逐条隔离）。
+
+    调用方是"重试 / 重做后裁剪了 result_path"——被丢弃步骤的产物成了孤儿。URL 的反解由存储服务做
+    （布局是它的私有知识），这里只说"这些条目我不要了"。未配置存储服务 → 跳过（返回 False）。
+    """
+    base = settings.STORAGE_INTERNAL_URL.strip().rstrip("/")
+    if not base or not urls:
+        return False
+    headers = {"X-Internal-Token": settings.STORAGE_INTERNAL_TOKEN}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(f"{base}/internal/tasks/{task_id}/results/deletions",
+                                     json={"urls": urls}, headers=headers)
+        return resp.status_code == 200
+    except httpx.HTTPError as e:
+        logger.warning("[storage] 批量删除产物失败 task_id=%s: %s", task_id, e)
+        return False

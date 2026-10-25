@@ -33,6 +33,7 @@
 """
 
 from webx.middleware.admin import admin_auth_middleware
+from webx.middleware.internal import internal_auth_middleware
 from webx.middleware.auth import (
     DEFAULT_CLAIMS,
     auth_middleware,
@@ -58,6 +59,7 @@ __all__ = [
     "DEFAULT_CLAIMS",
     "auth_middleware",
     "admin_auth_middleware",
+    "internal_auth_middleware",
     "make_auth_middleware",
     "make_role_middleware",
     # 权限（阶段 2/3）

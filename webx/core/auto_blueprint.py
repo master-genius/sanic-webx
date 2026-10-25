@@ -12,7 +12,7 @@
   - ``__blueprints__``：（可选）模块显式导出的蓝图列表；未定义则自动扫描模块属性。
 
 与原实现的唯一差别、也是通用化的关键：**controller 包路径由调用方传入**，
-不再写死 ``xymol.controllers``（原项目写死的那个）、也不再用 ``Path(__file__).parent.parent`` 推目录。
+不再写死某个具体的 controllers 包名（原项目就是写死的）、也不再用 ``Path(__file__).parent.parent`` 推目录。
 webx 是独立安装的包，那种写法只会扫到框架自己的安装目录。目录由
 ``importlib.util.find_spec`` 从包名反查，包与目录永远一致。
 """

@@ -4,7 +4,6 @@
 进程内的测试客户端每个请求都会起停一次应用，根本没有"挂着的请求"这回事。
 """
 
-import asyncio
 import os
 import socket
 import subprocess
@@ -14,10 +13,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-import asyncpg
 import httpx
 import pytest
-from tortoise import Tortoise
 
 ROOT = Path(__file__).resolve().parent.parent
 TOKEN = "ts-token"
@@ -30,31 +27,15 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _run(coro):
-    return asyncio.run(coro)
-
-
-async def _with_orm(dsn, fn):
-    from tests.conftest import reset_orm_caches
-
-    reset_orm_caches()  # 同进程里 sqlite 与 PG 混用时，模型缓存的 SQL 带着旧方言
-    await Tortoise.init(db_url=dsn, modules={"models": ["webx.models"]})
-    try:
-        return await fn()
-    finally:
-        await Tortoise.close_connections()
+from tests.pg_helpers import fetch, orm as _orm  # noqa: E402
 
 
 @pytest.fixture(scope="module")
 def schema(pg_dsn):
     """建好表与认领索引（只做一次）。"""
-    from webx.models.task import Task
+    from tests.pg_helpers import ensure_schema
 
-    async def go():
-        await Tortoise.generate_schemas(safe=True)
-        await Tortoise.get_connection("default").execute_query(Task.CLAIM_INDEX_DDL)
-
-    _run(_with_orm(pg_dsn, go))
+    ensure_schema(pg_dsn)
     return pg_dsn
 
 
@@ -67,27 +48,13 @@ def seed(dsn, n=1, task_type="demo", **kw):
             for _ in range(n)
         ]
 
-    return _run(_with_orm(dsn, go))
+    return _orm(dsn, go)
 
 
 def clear(dsn):
-    async def go():
-        conn = await asyncpg.connect(dsn)
-        await conn.execute("TRUNCATE tasks")
-        await conn.close()
+    from tests.pg_helpers import execute
 
-    _run(go())
-
-
-def fetch(dsn, sql, *args):
-    async def go():
-        conn = await asyncpg.connect(dsn)
-        try:
-            return await conn.fetch(sql, *args)
-        finally:
-            await conn.close()
-
-    return _run(go())
+    execute(dsn, "TRUNCATE tasks")
 
 
 def start_server(dsn, *, hold, fallback, db_port=None):

@@ -123,6 +123,21 @@ class TaskTypeSpec:
     resolve_timeout: Optional[Callable[..., int]] = None
     #: 提交前置闸（异步，超限就抛业务异常）：``(task) -> None``。在状态翻转之前调用，失败不留 PENDING 孤儿
     precheck_submit: Optional[Callable[[Any], Awaitable[None]]] = None
+    #: 提交时挂起钩子（异步）：``(task) -> bool``。返回 True = 钩子已接管（典型：先建一批子任务，
+    #: 把本任务挂起为 DRAFT + auto_post=1，等子任务算完再由补偿器的准入巡检投递），提交流程到此结束
+    hold_submit: Optional[Callable[[Any], Awaitable[bool]]] = None
+    #: 进入聚合步骤前**应当存在**的子任务 tag 列表：``(task, step) -> list[str]``。
+    #: 不登记 = 只检查已存在的子任务是否都完成；登记后，缺失的子任务也算"未就绪"
+    expected_child_tags: Optional[Callable[[Any, str], list[str]]] = None
+    #: 解析 retry / redo 传入的步骤令牌：``(steps_done, token) -> (裸步骤名, 截断索引|None)``。
+    #: 不登记 = 令牌就是步骤名，截断点取该步骤在轨迹中**最近一次**出现的位置。
+    #: 步骤可重复出现且需要消歧（如带序号的 "nvt_2"）的类型自己登记
+    resolve_step_token: Optional[Callable[[list[str], str], tuple[str, Optional[int]]]] = None
+    #: 把调用方传入的某一步参数归一化后并入已有参数：``(steps_done, step, incoming) -> dict``。不登记 = 原样并入
+    normalize_params: Optional[Callable[[list[str], str, dict], dict]] = None
+    #: 重置 / 重试后裁剪 result_path：``(result_path, kept_steps) -> (新值, 孤儿 URL 列表)``。
+    #: 不登记走通用裁剪（见 webx.lib.task_results.prune_result_path）
+    prune_result_path: Optional[Callable[[str, list[str]], tuple[str, list[str]]]] = None
     description: str = ""
 
 

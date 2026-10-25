@@ -256,6 +256,9 @@ def test_real_assembly_has_no_skipped_group(app_with_db):
         "webx_auth": [],  # 公开组，鉴权走路由级 @require_token
         "webx_user": ["auth_middleware"],
         "webx_file": ["auth_middleware"],
+        "webx_task": ["auth_middleware"],
+        "webx_admin_task": admin_chain,
+        "webx_internal_task": ["internal_auth_middleware"],  # 服务间令牌，整组一次覆盖
         "webx_account": admin_chain,
         "webx_auth_permission": admin_chain,
         "webx_permission": admin_chain,

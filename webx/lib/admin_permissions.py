@@ -26,6 +26,7 @@ _ADMIN_PERMISSIONS: dict[str, tuple[str, str, list[str]]] = {
     "delete-admin": ("删除账号", "", ["super"]),
     "view-auth-permission": ("查看单独授权", "查看组织内用户的单独权限记录", ["super", "senior", "manager"]),
     "auth-permission": ("授予单独权限", "为组织内用户授予单独权限", ["super", "senior"]),
+    "list-task": ("查看任务", "查看全站任务列表与统计", ["super", "senior", "manager", "operator", "watcher"]),
     "cancel-auth-permission": ("撤销单独权限", "撤销组织内用户的单独权限", ["super", "senior"]),
 }
 

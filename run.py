@@ -47,7 +47,7 @@ from webx.core.app import create_app  # noqa: E402
 DEFAULT_MODULES = env.str("WEBX_MODULES", "app")
 
 # 挂载哪些**内置**路由组。与 WEBX_MODULES 是两个独立开关：前者管业务模块，
-# 这个管框架自带的 auth / api / admin / public 四组，且内置组恒排在业务模块**之前**加载。
+# 这个管框架自带的 auth / api / admin / public / internal 五组，且内置组恒排在业务模块**之前**加载。
 #   不配 / 留空 / 无法识别   四组全挂（默认，等同 builtin_controller=True）
 #   false / 0 / no / none    一组都不挂，纯业务服务
 #   auth,api                 只挂列出的组；写错的组名剔除并告警
@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--builtin",
         default=DEFAULT_BUILTIN,
-        help="挂载哪些内置路由组，逗号分隔（可选 auth,api,admin,public）；"
+        help="挂载哪些内置路由组，逗号分隔（可选 auth,api,admin,public,internal）；"
         "不给则全挂。亦可用环境变量 WEBX_BUILTIN",
     )
     parser.add_argument(

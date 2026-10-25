@@ -39,7 +39,15 @@ def build_cors_headers(request: Request) -> dict[str, str]:
 
 
 def setup_cors(app) -> None:
-    """为应用注册 CORS：预检短路 + 响应头注入。"""
+    """为应用注册 CORS：预检短路 + 响应头注入。
+
+    **幂等**：它挂在 ``before_server_start`` 里，而同一个 app 对象可以被启动多次（开发热重载、测试客户端
+    每个请求起停一次）。不幂等的话每次启动都会再叠一层中间件——除了重复加头，更糟的是路由器的信号表
+    随之逐次膨胀，数百次重启后 ``sanic_routing`` 生成路由树时递归超限（``RecursionError``）。
+    """
+    if getattr(app.ctx, "_webx_cors_installed", False):
+        return
+    app.ctx._webx_cors_installed = True
 
     @app.middleware("request")
     async def _cors_preflight(request: Request):

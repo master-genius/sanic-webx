@@ -290,3 +290,15 @@ def test_delete_prunes_empty_parents_but_never_the_root(store):
 
 def test_delete_missing_object_returns_false(store):
     assert store.delete("nope/none.txt") is False
+
+
+@pytest.mark.parametrize("bad", ["a/b", "../x", "a\\b", ""])
+def test_writer_finalize_rejects_names_that_are_not_a_single_filename(store, bad):
+    """filename 带路径分隔符会被当成不存在的子目录，落位时 FileNotFoundError → 接口 500。必须 400。"""
+    w = store.open_writer("b")
+    w.write(b"x")
+    with pytest.raises(StoreError) as ei:
+        w.finalize(bad)
+    assert ei.value.status == 400
+    w.abort()
+

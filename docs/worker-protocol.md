@@ -129,6 +129,9 @@ worker 的**持久重试队列**对"永不放弃"与"永久拒绝"的区分依�
 grace 随已投入时长变化，租约时长每跳都不同，worker 无法自行推算，必须由服务端每跳告知——
 否则自熔时刻会漂到服务端回收之后（出现"服务端已租给 B、A 仍认为自己持有"的窗口）。
 
+任务不存在 / 已软删：`404 {"ok": false, "reason": "gone"}`（worker 视为 server-gone，终止本次执行）。
+令牌缺失 / 畸形也按"被撤销"答复 `200 + status=revoked`，不 500。
+
 ### 4.3 `PUT /internal/tasks/<id>/status` —— 状态上报
 
 `{"status": "running", "error_message": ""}` → `200 {"message": ...}`；非法状态 `400`；非法迁移 `400`。

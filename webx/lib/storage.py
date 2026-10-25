@@ -270,6 +270,10 @@ class ObjectWriter:
         文件名先校验再落位——避免把 .tmp move 到非法路径。
         非法文件名抛 ``StoreError``，调用方负责 ``abort()``。
         """
+        # filename 是**单个文件名**，不是键：带路径分隔符的会被当成子目录，而 tmp 所在目录里并没有它——
+        # 落位时 FileNotFoundError，接口 500。在这里按 400 拒绝
+        if not filename or "/" in filename or "\\" in filename:
+            raise StoreError(f"非法文件名: {filename!r}", status=400)
         key = f"{self._prefix}/{filename}" if self._prefix else filename
         final_path = self._store.path_for(key)
 

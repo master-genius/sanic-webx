@@ -34,6 +34,14 @@ from tortoise import Tortoise  # noqa: E402
 TEST_MODELS = ["app.models", "webx.models"]
 
 
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 def reset_orm_caches() -> None:
     """清掉 Tortoise 按 (连接名, schema, 表名) 缓存的 INSERT / UPDATE 语句。
 
@@ -173,8 +181,14 @@ def app_with_db(tmp_path_factory):
         await Tortoise.close_connections()
 
     # 存储根指向临时目录，避免测试往仓库里写文件
-    from webx.config import settings
-    settings.STORAGE_DIR = str(tmp_path_factory.mktemp("storage"))
+    # ⚠️ 必须设在真实配置对象上：`webx.config.settings` 是只读代理，对它 setattr 只会在代理自己身上
+    # 加个影子属性，而 ``settings.storage_path`` 这类属性读的是底层对象——曾因此让 e2e 一直把文件
+    # 写进仓库的 ./storage，而不是临时目录
+    from webx.config import get_settings
+    get_settings().STORAGE_DIR = str(tmp_path_factory.mktemp("storage"))
+    # 其它用例可能已经用默认目录创建过全局存储门面，换目录后要丢掉它缓存的 store
+    from webx.services.storage_service import storage_service
+    storage_service._store = storage_service._chunked = storage_service._signer = None
 
     Sanic.test_mode = True
     application = create_app(
@@ -242,3 +256,76 @@ async def pgdb(pg_dsn):
     finally:
         await Tortoise.close_connections()
 
+
+@pytest.fixture(scope="session")
+def pg_app(pg_dsn):
+    """会话级：一个专用的、连真实 PG 的完整应用（认领 / 租约的 SQL 是 PG 专有的）。
+
+    为什么不复用会话级的 ``app_with_db``：
+      1. 它被大量 sqlite 用例反复起停过，留下的状态会让后来的 ``ReusableClient.run()`` 在
+         ``_start_servers`` 里抛 "Cannot name task outside of a running application"；
+      2. sanic-testing 每起停一次就往路由器上叠中间件和信号路由，共用的 app 累计到 ~870 次起停后
+         ``sanic_routing`` 生成路由树时递归超限——专用 app 把 PG 用例的开销隔离在自己名下。
+    同一个进程里装配两个 app 共用同一批蓝图是可以的（当前 Sanic 版本实测），但**再多装配一个**
+    （比如每个模块各一个）会在路由注册时撞 "Route already registered"——所以整个会话共用这一个，
+    每个用例通过 ``ReusableClient`` 只起停它一次。
+    """
+    from webx.config import get_settings
+    from webx.core.app import create_app
+
+    async def init_pg(sanic_app):
+        reset_orm_caches()
+        await Tortoise.init(db_url=pg_dsn, modules={"models": TEST_MODELS}, _enable_global_fallback=True)
+        await Tortoise.generate_schemas(safe=True)
+
+    async def close_pg(sanic_app):
+        await Tortoise.close_connections()
+
+    get_settings().STORAGE_DIR = str(__import__("tempfile").mkdtemp(prefix="webx-test-storage-"))
+    from webx.services.storage_service import storage_service
+    storage_service._store = storage_service._chunked = storage_service._signer = None
+
+    Sanic.test_mode = True
+    name = "webx_pg_e2e"
+    # 只装配内置路由：任务接口都在内置组里，不需要业务示例 app.controller
+    # （它的模块级蓝图在前序用例里被反复装配 / 重新 import，再装一次会撞 "Route already registered"）
+    application = create_app(name=name, use_db=False, on_startup=[init_pg], on_shutdown=[close_pg])
+    try:
+        yield application
+    finally:
+        Sanic._app_registry.pop(name, None)
+
+
+@pytest.fixture
+def use_pg(pg_app, pg_dsn):
+    """本用例内连干净的真实 PG，返回一个**可复用的**测试客户端（每个用例只起停一次应用）。
+
+    不用 ``app.test_client``：它每发一个请求就把应用完整起停一次，请求数多的用例既慢又会
+    加速 sanic-testing 的累积。
+    """
+    from sanic_testing.reusable import ReusableClient
+    from tests.pg_helpers import ensure_schema, reset_schema
+
+    reset_schema(pg_dsn)
+    ensure_schema(pg_dsn)  # 直接调服务层的用例没有"应用启动时建表"这一步
+    # ReusableClient 默认用 randint(5000, 65000) 选端口，偶尔撞上已被占用的端口（Errno 98），
+    # 一次失败还会让应用状态错乱、引发后面一连串 error。改由操作系统分配确定空闲的端口，
+    # 并对"刚探测完又被别人抢走"的极小窗口做重试
+    last = None
+    for _ in range(5):
+        client = ReusableClient(pg_app, port=_free_port())
+        try:
+            client.run()
+            break
+        except OSError as e:
+            last = e
+            try:
+                client.stop()
+            except Exception:  # noqa: BLE001 —— 启动都没成功，停止失败不重要
+                pass
+    else:
+        raise last
+    try:
+        yield client
+    finally:
+        client.stop()

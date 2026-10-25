@@ -41,7 +41,7 @@ Hook = Callable[[Sanic], Awaitable[None]]
 
 
 # 可单独开关的内置路由组
-BUILTIN_GROUPS = ("auth", "api", "admin", "public")
+BUILTIN_GROUPS = ("auth", "api", "admin", "public", "internal")
 
 
 def _builtin_packages(spec: bool | Iterable[str]) -> list[str]:
