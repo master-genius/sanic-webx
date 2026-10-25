@@ -47,4 +47,46 @@
 
 ## 存量排查
 
-（在统一排查阶段填写。）
+范围：webx 核心（`auth` / `api` / `admin` / `public` / `internal` 五个内置组）、`webx_storage`、`task_server`，
+共 110 条路由（Web 服务 82 + 存储服务 25 + 领取服务 3，含兼容别名与探活，按方法 × 路径计，不含 HEAD / OPTIONS）。
+判据是上面的 10 条规则；业务示例模块 `app` 的 4 条（`/api/notes` ×3、`/public/welcome`）不在框架范围内。
+
+### 本次已改（旧路径保留为废弃别名，只转发，带 `Deprecation: true` 与 `Link: <规范路径>; rel="successor-version"`）
+
+| 旧 | 规范 | 为什么 |
+|---|---|---|
+| `POST /api/files/<bucket>/<filename>/sign` | `POST /api/files/<bucket>/<filename>/signatures` | `sign` 是动词；签名是被创建出来的东西，按规则 4 名词化，也与存储服务的 `/internal/signatures` 一致 |
+| `GET/PATCH/DELETE /api/files/uploads/<id>`<br>`POST /api/files/uploads/<id>/complete` | `/api/uploads/<id>`<br>`/api/uploads/<id>/complete` | 分片会话是独立资源（会话 id 已携带目标键），不该挂在 bucket 之下。旧路径与 `/api/files/<bucket>/<filename>` 同形，**名为 `uploads` 的 bucket 里的文件下载会被会话路由遮住**——这是实际缺陷，不只是风格问题 |
+| `POST /api/admin/account/<id>/passwd` | `PUT /api/admin/account/<id>/passwd` | 设置子资源的值是 `PUT`，与 `PUT /api/user/passwd` 一致；权限判定不变 |
+
+创建分片会话仍是 `POST /api/files/<bucket>/uploads`（“在这个 bucket 里创建一个上传”，名词，保持不变）。
+
+**别名的下线条件**：确认没有调用方后删除，一并解除上面“名为 `uploads` 的 bucket”的遮蔽——在别名存在期间，
+`GET /api/files/uploads/<x>` 仍会命中会话别名而不是 bucket 里的文件（按规范路径 `/api/files/<bucket>/<name>` 以外的写法无法区分）。
+这是保留别名的已知代价。
+
+### 本次新增的接口：已按规范设计，无需改动
+
+- 任务：`/api/tasks`（集合 + `<id>`）、`PATCH /<id>`、`PUT /<id>/info`、子资源 `/children` `/files`；
+  状态迁移 `submit / cancel / retry / revise / redo` 是对已有任务的状态变化，没有合适名词，按规则 3 保留动词。
+- 内部回调：`/internal/tasks/<id>/{heartbeats,fields,steps,deliveries,files}` 全是名词；`status` 用 `PUT`；
+  `complete` / `fail` / `ack` 是状态迁移；归还租约是 `DELETE .../lease`（路径里没有 delete / release）。
+- 领取服务：`POST /task/leases`（创建一次领取）、`POST /task/pokes`（创建一次唤醒）。
+- 存储服务：`/internal/objects`、`/internal/uploads`、`/internal/signatures` 规范；兼容别名见 `storage-service.md`。
+
+### 评估后**有意不改**（有风险，仅记录）
+
+| 路由 | 问题 | 不改的原因 | 建议 |
+|---|---|---|---|
+| `POST /auth/login` `/auth/admin-login` `/auth/logout` `/auth/refresh` `/auth/register` | 按规则 5 应建模为 `POST /auth/sessions`、`DELETE /auth/sessions`、`POST /accounts` | 登录 / 注册 / 登出是几乎所有前端与第三方都按字面写死的路径，且鉴权中间件的白名单、限流、审计都按路径配置；收益只是风格，风险是全站登录失效 | 若要改，随一次大版本一起做，旧路径别名保留一个完整版本周期 |
+| `POST /auth/verifycode` `/auth/verifycode-login` `/auth/account/change-by-code` | 路径里带动作（`change-by-code` 最重） | 同上，且 `change-by-code` 同时承载找回密码与换绑，拆分需要业务确认 | 同上 |
+| `POST /api/user/{email,mobile}/bind` `/unbind` `/bind/code` | `bind` 应为 `PUT /api/user/email`；`unbind` 应为 `DELETE /api/user/email` | 解绑要求在请求体里带当前密码，而 `DELETE` 带请求体会被不少网关丢弃（规则 4）；只改 bind 不改 unbind 会把成对接口拆成两种风格 | 改成 `PUT` + “解绑 = `POST /api/user/email/removals`（名词化）”前先确认前端 |
+| `DELETE /internal/tasks/<task_id>`（存储服务） | 语义是“删除该任务的全部产物”，路径却只有任务 id，与 Web 服务里的 `/internal/tasks/<id>` 同形不同义 | 这是旧存储契约的兼容路径，调用方（`storage_client.delete_results`）已固定 | 新调用方用 `POST /internal/tasks/<id>/results/deletions` |
+| `PUT /api/tasks/<id>/info` 与 `PATCH /api/tasks/<id>` | 两条编辑路径容易混淆 | `info` 只改展示用基本信息，`PATCH` 改参数并推进状态机，权限与副作用不同 | 文档里已区分；如需合并，先统一副作用模型 |
+| `GET /`、`GET /health` | 无 | 约定俗成的探活路径 | — |
+
+### 仍存在的别名（均在存储服务，已在 `storage-service.md` 列出对照表）
+
+`/internal/objects/upload`、`/internal/sign`、`/internal/tasks/<id>/results/{upload,upload/init,deletes}`、
+`/public/tasks/<id>/results[/<file>]`。它们让既有 worker / 前端的上传契约无需改动即可对接，同样只转发。
+

@@ -22,6 +22,7 @@ from sanic.request import Request
 from sanic.response import json
 
 from webx.i18n import get_lang_from_header, t
+from webx.lib.deprecated_alias import deprecated_alias
 from webx.lib.storage import StoreError
 from webx.services.storage_http import (
     append_chunk,
@@ -35,6 +36,10 @@ from webx.services.storage_service import storage_service
 logger = logging.getLogger(__name__)
 
 file_bp = Blueprint("webx_file", url_prefix="/api/files")
+#: 分片会话是独立资源（会话 id 已携带目标键），不该挂在 ``/api/files/<bucket>`` 之下：
+#: 旧路径 ``/api/files/uploads/<id>`` 与 ``/api/files/<bucket>/<filename>`` 同形，
+#: 名为 ``uploads`` 的 bucket 里的文件会被会话路由遮住，下载不到。
+upload_bp = Blueprint("webx_upload", url_prefix="/api/uploads")
 
 
 def _key(bucket: str, name: str) -> str:
@@ -115,7 +120,7 @@ async def upload_init(request: Request, bucket: str):
     return json({"data": session}, status=201)
 
 
-@file_bp.get("/uploads/<upload_id:str>")
+@upload_bp.get("/<upload_id:str>")
 async def upload_status(request: Request, upload_id: str):
     """查询会话当前 offset——断线重连后先查这里，再从该处续发。"""
     try:
@@ -127,7 +132,7 @@ async def upload_status(request: Request, upload_id: str):
     return with_offset({"data": session}, session["offset"])
 
 
-@file_bp.patch("/uploads/<upload_id:str>", stream=True)
+@upload_bp.patch("/<upload_id:str>", stream=True)
 async def upload_chunk(request: Request, upload_id: str):
     """追加一个分片。
 
@@ -137,7 +142,7 @@ async def upload_chunk(request: Request, upload_id: str):
     return await append_chunk(request, storage_service.chunked, upload_id)
 
 
-@file_bp.post("/uploads/<upload_id:str>/complete")
+@upload_bp.post("/<upload_id:str>/complete")
 async def upload_complete(request: Request, upload_id: str):
     """完成分片上传：校验字节数后原子落位。"""
     lang = get_lang_from_header(request.headers)
@@ -154,7 +159,7 @@ async def upload_complete(request: Request, upload_id: str):
     )
 
 
-@file_bp.delete("/uploads/<upload_id:str>")
+@upload_bp.delete("/<upload_id:str>")
 async def upload_abort(request: Request, upload_id: str):
     """放弃分片上传并清理会话（幂等）。"""
     try:
@@ -206,7 +211,7 @@ async def head_file(request: Request, bucket: str, filename: str):
     return storage_service.head(path)
 
 
-@file_bp.post("/<bucket:str>/<filename:str>/sign")
+@file_bp.post("/<bucket:str>/<filename:str>/signatures")
 async def issue_sign(request: Request, bucket: str, filename: str):
     """签发限时下载链接，供无需登录的场景（分享、第三方回源）使用。"""
     bucket = decode_param(bucket)
@@ -230,3 +235,17 @@ async def delete_file(request: Request, bucket: str, filename: str):
     if not storage_service.store.delete(_key(bucket, filename)):
         return json({"error": t("not_found", lang)}, status=404)
     return json({"message": t("success", lang)})
+
+
+# ==================== 已废弃的兼容别名（只转发，见 docs/api-conventions.md 规则 9）====================
+
+deprecated_alias(file_bp, issue_sign, "/<bucket:str>/<filename:str>/sign", methods=["POST"],
+                 successor="/api/files/{bucket}/{filename}/signatures", name="issue_sign_deprecated")
+deprecated_alias(file_bp, upload_status, "/uploads/<upload_id:str>", methods=["GET"],
+                 successor="/api/uploads/{upload_id}", name="upload_status_deprecated")
+deprecated_alias(file_bp, upload_chunk, "/uploads/<upload_id:str>", methods=["PATCH"],
+                 successor="/api/uploads/{upload_id}", name="upload_chunk_deprecated", stream=True)
+deprecated_alias(file_bp, upload_complete, "/uploads/<upload_id:str>/complete", methods=["POST"],
+                 successor="/api/uploads/{upload_id}/complete", name="upload_complete_deprecated")
+deprecated_alias(file_bp, upload_abort, "/uploads/<upload_id:str>", methods=["DELETE"],
+                 successor="/api/uploads/{upload_id}", name="upload_abort_deprecated")

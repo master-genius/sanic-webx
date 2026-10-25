@@ -48,7 +48,7 @@ DEFAULT_MODULES = env.str("WEBX_MODULES", "app")
 
 # 挂载哪些**内置**路由组。与 WEBX_MODULES 是两个独立开关：前者管业务模块，
 # 这个管框架自带的 auth / api / admin / public / internal 五组，且内置组恒排在业务模块**之前**加载。
-#   不配 / 留空 / 无法识别   四组全挂（默认，等同 builtin_controller=True）
+#   不配 / 留空 / 无法识别   五组（auth/api/admin/public/internal）全挂（默认，等同 builtin_controller=True）
 #   false / 0 / no / none    一组都不挂，纯业务服务
 #   auth,api                 只挂列出的组；写错的组名剔除并告警
 DEFAULT_BUILTIN = env.str("WEBX_BUILTIN", "")

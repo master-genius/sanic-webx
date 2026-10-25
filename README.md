@@ -451,14 +451,14 @@ curl -H "Authorization: Bearer $T" -F file=@big.zip /api/files/mybucket
 # 分片上传：init → 逐片 PATCH → complete
 curl -X POST -H "Authorization: Bearer $T" -d '{"filename":"big.zip","total":10485760}' \
      /api/files/mybucket/uploads
-curl -X PATCH -H "Upload-Offset: 0" --data-binary @part0 /api/files/uploads/$UID
-curl -X POST /api/files/uploads/$UID/complete
+curl -X PATCH -H "Upload-Offset: 0" --data-binary @part0 /api/uploads/$UID
+curl -X POST /api/uploads/$UID/complete
 
 # 下载（流式 + Range 断点续传）
 curl -H "Range: bytes=0-1023" /api/files/mybucket/big.zip
 
 # 签发限时链接 → 无需登录即可下载
-curl -X POST -d '{"ttl_seconds":600}' /api/files/mybucket/big.zip/sign
+curl -X POST -d '{"ttl_seconds":600}' /api/files/mybucket/big.zip/signatures
 ```
 
 三条从生产事故换来的约束，改动前先读懂：

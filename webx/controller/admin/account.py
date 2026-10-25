@@ -22,6 +22,7 @@ from webx.lib.roles import ROLES, default_role
 from webx.services.admin_service import admin_service
 from webx.middleware import has_perm, is_privileged
 from webx.models import UserOrg, UserRole
+from webx.lib.deprecated_alias import deprecated_alias
 from webx.lib.funcs import now_ms
 from webx.lib.genid import gen_id
 
@@ -146,7 +147,7 @@ async def update_account(request: Request, account_id: str, body: AccountUpdateR
     admin = await Admin.filter(id=account_id).first()
     return json({"data": _view(admin)})
 
-@account_bp.post("/<account_id:str>/passwd")
+@account_bp.put("/<account_id:str>/passwd")
 @validate(json=AccountResetPasswdRequest)
 async def reset_passwd(request: Request, account_id: str, body: AccountResetPasswdRequest):
     """重置密码。改自己永远允许，改别人需要 update-admin-passwd。"""
@@ -166,6 +167,11 @@ async def reset_passwd(request: Request, account_id: str, body: AccountResetPass
 
     await admin_service.update_passwd(account_id, body.passwd)
     return json({"data": {"count": 1}})
+
+
+# 旧方法是 POST；设置一个子资源的值是 PUT（与 /api/user/passwd 一致）。只转发，见 api-conventions 规则 9
+deprecated_alias(account_bp, reset_passwd, "/<account_id:str>/passwd", methods=["POST"],
+                 successor="/api/admin/account/{account_id}/passwd", name="reset_passwd_deprecated")
 
 @account_bp.delete("/<account_id:str>")
 async def delete_account(request: Request, account_id: str):

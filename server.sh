@@ -42,7 +42,7 @@ usage() {
   --workers <数量>    worker 数量     (默认: $WORKERS)
   --modules <列表>    装配哪些业务模块，逗号分隔，如 app 或 app,appx
                       (默认: 环境变量 WEBX_MODULES，再默认 app)
-  --builtin <列表>    只挂这些内置路由组，逗号分隔(auth,api,admin,public)
+  --builtin <列表>    只挂这些内置路由组，逗号分隔(auth,api,admin,public,internal)
                       (默认: 环境变量 WEBX_BUILTIN；不配则全挂)
   --no-builtin        一个内置路由组都不挂（优先级最高）
   --debug             开启 debug（详细日志 + 错误堆栈）

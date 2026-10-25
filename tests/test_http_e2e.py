@@ -344,7 +344,7 @@ def test_signed_public_download(http_app, captured_codes_module):
     http_app.test_client.post("/api/files/pub", data=body, headers={**headers, **ct})
 
     _, signed = http_app.test_client.post(
-        "/api/files/pub/pub.txt/sign", json={"ttl_seconds": 600}, headers=headers
+        "/api/files/pub/pub.txt/signatures", json={"ttl_seconds": 600}, headers=headers
     )
     assert signed.status == 200
     sign = signed.json["data"]["sign"]
@@ -373,7 +373,7 @@ def test_signed_url_cannot_be_moved_to_another_file(http_app, captured_codes_mod
         body, ct = _multipart(name, b"data")
         http_app.test_client.post("/api/files/mv", data=body, headers={**headers, **ct})
 
-    _, signed = http_app.test_client.post("/api/files/mv/mine.txt/sign", headers=headers)
+    _, signed = http_app.test_client.post("/api/files/mv/mine.txt/signatures", headers=headers)
     sign = signed.json["data"]["sign"]
 
     _, moved = http_app.test_client.get(f"/public/files/mv/yours.txt?sign={sign}")
@@ -391,22 +391,22 @@ def test_chunked_upload_over_http(http_app, captured_codes_module):
     uid = init.json["data"]["upload_id"]
 
     _, p1 = http_app.test_client.patch(
-        f"/api/files/uploads/{uid}", data=b"abcd",
+        f"/api/uploads/{uid}", data=b"abcd",
         headers={**headers, "Upload-Offset": "0"},
     )
     assert p1.json["data"]["offset"] == 4
 
-    _, status = http_app.test_client.get(f"/api/files/uploads/{uid}", headers=headers)
+    _, status = http_app.test_client.get(f"/api/uploads/{uid}", headers=headers)
     assert status.json["data"]["offset"] == 4
 
     _, p2 = http_app.test_client.patch(
-        f"/api/files/uploads/{uid}", data=b"efgh",
+        f"/api/uploads/{uid}", data=b"efgh",
         headers={**headers, "Upload-Offset": "4"},
     )
     assert p2.json["data"]["offset"] == 8
 
     _, done = http_app.test_client.post(
-        f"/api/files/uploads/{uid}/complete", headers=headers
+        f"/api/uploads/{uid}/complete", headers=headers
     )
     assert done.status == 200
     assert done.json["data"]["key"] == "big/big.bin"
@@ -422,11 +422,11 @@ def test_chunked_offset_conflict_returns_real_offset(http_app, captured_codes_mo
     )
     uid = init.json["data"]["upload_id"]
     http_app.test_client.patch(
-        f"/api/files/uploads/{uid}", data=b"abc", headers={**headers, "Upload-Offset": "0"}
+        f"/api/uploads/{uid}", data=b"abc", headers={**headers, "Upload-Offset": "0"}
     )
 
     _, dup = http_app.test_client.patch(
-        f"/api/files/uploads/{uid}", data=b"abc", headers={**headers, "Upload-Offset": "0"}
+        f"/api/uploads/{uid}", data=b"abc", headers={**headers, "Upload-Offset": "0"}
     )
     assert dup.status == 409
     assert dup.json["offset"] == 3, "要把真实 offset 回给客户端以便重新对齐"
@@ -730,15 +730,15 @@ def test_chunk_responses_carry_upload_offset_header(http_app, sh):
     uid = _new_session(http_app, headers, "oh")
 
     _, p1 = http_app.test_client.patch(
-        f"/api/files/uploads/{uid}", data=b"abcd", headers={**headers, "Upload-Offset": "0"}
+        f"/api/uploads/{uid}", data=b"abcd", headers={**headers, "Upload-Offset": "0"}
     )
     assert p1.headers["Upload-Offset"] == "4" and p1.json["offset"] == 4
 
-    _, st = http_app.test_client.get(f"/api/files/uploads/{uid}", headers=headers)
+    _, st = http_app.test_client.get(f"/api/uploads/{uid}", headers=headers)
     assert st.headers["Upload-Offset"] == "4" and st.json["offset"] == 4
 
     _, bad = http_app.test_client.patch(
-        f"/api/files/uploads/{uid}", data=b"zz", headers={**headers, "Upload-Offset": "99"}
+        f"/api/uploads/{uid}", data=b"zz", headers={**headers, "Upload-Offset": "99"}
     )
     assert bad.status == 409
     assert bad.headers["Upload-Offset"] == "4", "409 必须用头带回真实 offset"
@@ -749,7 +749,7 @@ def test_empty_chunk_is_rejected(http_app, sh):
     headers = sh
     uid = _new_session(http_app, headers, "ec")
     _, resp = http_app.test_client.patch(
-        f"/api/files/uploads/{uid}", data=b"", headers={**headers, "Upload-Offset": "0"}
+        f"/api/uploads/{uid}", data=b"", headers={**headers, "Upload-Offset": "0"}
     )
     assert resp.status == 400
 
@@ -762,10 +762,10 @@ def test_oversized_chunk_is_413_and_session_offset_stays_truthful(http_app, sh, 
     uid = _new_session(http_app, headers, "bc")
 
     _, resp = http_app.test_client.patch(
-        f"/api/files/uploads/{uid}", data=b"x" * 64, headers={**headers, "Upload-Offset": "0"}
+        f"/api/uploads/{uid}", data=b"x" * 64, headers={**headers, "Upload-Offset": "0"}
     )
     assert resp.status == 413
-    _, st = http_app.test_client.get(f"/api/files/uploads/{uid}", headers=headers)
+    _, st = http_app.test_client.get(f"/api/uploads/{uid}", headers=headers)
     assert st.json["offset"] == 0, "被拒的分片不得推进 offset"
 
 
@@ -783,7 +783,7 @@ def test_head_reports_length_and_range_support(http_app, sh):
     _, missing = http_app.test_client.head("/api/files/hd/none.bin", headers=headers)
     assert missing.status == 404
 
-    _, signed = http_app.test_client.post("/api/files/hd/h.bin/sign", headers=headers)
+    _, signed = http_app.test_client.post("/api/files/hd/h.bin/signatures", headers=headers)
     sign = signed.json["data"]["sign"]
     _, pub = http_app.test_client.head(f"/public/files/hd/h.bin?sign={sign}")
     assert pub.status == 200 and pub.headers["Content-Length"] == "10"
@@ -816,3 +816,113 @@ def test_reserved_dot_names_cannot_be_uploaded(http_app, sh):
     body, ct = _multipart("ok.txt", b"x")
     _, resp = http_app.test_client.post("/api/files/.uploads", data=body, headers={**headers, **ct})
     assert resp.status == 400
+
+
+# ==================== 已废弃别名（docs/api-conventions.md 规则 9）====================
+
+
+_ALIAS_USER: dict = {}
+
+
+def _alias_headers(http_app, captured):
+    """别名用例共用一个登录用户：每个用例新注册会撞 IP 发码限流（30/min）。"""
+    if "h" not in _ALIAS_USER:
+        # 前面的用例已把本分钟的 IP 发码额度用完：清掉计数依据（发码记录）再注册
+        with _e2e_db(http_app) as db:
+            db.execute("DELETE FROM verify_code")
+        _ALIAS_USER["h"] = _auth(http_app, captured, "aliasuser", "aliasuser@example.com")
+    return _ALIAS_USER["h"]
+
+
+def _assert_deprecated(resp, successor: str):
+    assert resp.headers.get("Deprecation") == "true"
+    assert resp.headers.get("Link") == f'<{successor}>; rel="successor-version"'
+
+
+def test_deprecated_upload_session_paths_forward_to_canonical(http_app, captured_codes_module):
+    """旧的 /api/files/uploads/<id> 仍可用：行为与规范路径完全一致，且带 Deprecation / Link 头。
+    规范路径本身不带这两个头。"""
+    headers = _alias_headers(http_app, captured_codes_module)
+    _, init = http_app.test_client.post(
+        "/api/files/al/uploads", json={"filename": "a.bin", "total": 6}, headers=headers
+    )
+    uid = init.json["data"]["upload_id"]
+
+    _, p1 = http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"abc", headers={**headers, "Upload-Offset": "0"}
+    )
+    assert p1.status == 200 and p1.json["data"]["offset"] == 3
+    _assert_deprecated(p1, f"/api/uploads/{uid}")
+
+    _, st_old = http_app.test_client.get(f"/api/files/uploads/{uid}", headers=headers)
+    _, st_new = http_app.test_client.get(f"/api/uploads/{uid}", headers=headers)
+    assert st_old.json == st_new.json and st_old.headers["Upload-Offset"] == "3"
+    _assert_deprecated(st_old, f"/api/uploads/{uid}")
+    assert "Deprecation" not in st_new.headers and "Link" not in st_new.headers
+
+    # 新旧混用同一个会话：续传走规范路径，完成走旧路径
+    http_app.test_client.patch(
+        f"/api/uploads/{uid}", data=b"def", headers={**headers, "Upload-Offset": "3"}
+    )
+    _, done = http_app.test_client.post(f"/api/files/uploads/{uid}/complete", headers=headers)
+    assert done.status == 200 and done.json["data"]["key"] == "al/a.bin"
+    _assert_deprecated(done, f"/api/uploads/{uid}/complete")
+    _, down = http_app.test_client.get("/api/files/al/a.bin", headers=headers)
+    assert down.body == b"abcdef"
+
+    _, init2 = http_app.test_client.post(
+        "/api/files/al/uploads", json={"filename": "b.bin"}, headers=headers
+    )
+    uid2 = init2.json["data"]["upload_id"]
+    _, ab = http_app.test_client.delete(f"/api/files/uploads/{uid2}", headers=headers)
+    assert ab.status == 200
+    _assert_deprecated(ab, f"/api/uploads/{uid2}")
+
+
+def test_deprecated_sign_path_forwards_to_signatures(http_app, captured_codes_module):
+    headers = _alias_headers(http_app, captured_codes_module)
+    body, ct = _multipart("s.txt", b"sig")
+    http_app.test_client.post("/api/files/alsig", data=body, headers={**headers, **ct})
+
+    _, old = http_app.test_client.post("/api/files/alsig/s.txt/sign", headers=headers)
+    _, new = http_app.test_client.post("/api/files/alsig/s.txt/signatures", headers=headers)
+    assert old.status == new.status == 200
+    assert old.json["data"]["key"] == new.json["data"]["key"] == "alsig/s.txt"
+    _assert_deprecated(old, "/api/files/alsig/s.txt/signatures")
+    assert "Deprecation" not in new.headers
+
+
+def test_bucket_named_uploads_is_no_longer_shadowed_by_session_routes(http_app, captured_codes_module):
+    """规范路径移到 /api/uploads 后，名为 uploads 的 bucket 里的文件可以按规范路径正常下载
+    （旧别名仍在时，/api/files/uploads/<x> 依旧会被会话路由抢走——所以别名要尽早下线）。"""
+    headers = _alias_headers(http_app, captured_codes_module)
+    body, ct = _multipart("f.txt", b"in-bucket-uploads")
+    http_app.test_client.post("/api/files/uploads", data=body, headers={**headers, **ct})
+    _, lst = http_app.test_client.get("/api/files/uploads", headers=headers)
+    assert "f.txt" in lst.json["data"]["files"]
+
+
+def test_admin_passwd_reset_is_put_with_post_kept_as_deprecated_alias(http_app):
+    """设置子资源的值是 PUT（与 /api/user/passwd 一致）；POST 保留为别名。鉴权对两者一致生效。"""
+    routes = {(m, r.path) for r in http_app.router.routes for m in r.methods}
+    assert ("PUT", "api/admin/account/<account_id:str>/passwd") in routes
+    assert ("POST", "api/admin/account/<account_id:str>/passwd") in routes
+    for method in ("put", "post"):
+        _, resp = getattr(http_app.test_client, method)(
+            "/api/admin/account/x/passwd", json={"passwd": "Abcdef123!"}
+        )
+        assert resp.status == 401, method
+
+
+def test_upload_session_routes_require_login_on_both_canonical_and_alias(http_app):
+    """别名不能成为绕过鉴权的后门：匿名访问新旧会话路径、旧签名路径一律 401。"""
+    c = http_app.test_client
+    for method, path in (
+        ("get", "/api/uploads/x"), ("patch", "/api/uploads/x"), ("post", "/api/uploads/x/complete"),
+        ("delete", "/api/uploads/x"),
+        ("get", "/api/files/uploads/x"), ("patch", "/api/files/uploads/x"),
+        ("post", "/api/files/uploads/x/complete"), ("delete", "/api/files/uploads/x"),
+        ("post", "/api/files/b/f/sign"), ("post", "/api/files/b/f/signatures"),
+    ):
+        _, resp = getattr(c, method)(path)
+        assert resp.status == 401, (method, path, resp.status)
