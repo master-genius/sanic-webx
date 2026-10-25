@@ -8,9 +8,9 @@
 ⚠️ 它是**协议的参考实现**，不是生产服务：单进程、内存状态、线程化。但刻意做得「够严」，
 让违反协议的 worker 一定会在这里露馅：
 
-  · 写端点**一律强制 fencing**（请求头优先，其次 JSON 体 / 表单字段）；缺令牌、令牌不符、
-    终态任务分别回 `403 {"ok": false, "reason": "missing_fencing_token" / "not_lessee" /
-    "already_final"}`；任务不存在回 `403 gone`。
+  · 写端点**一律强制 fencing**（请求头优先，其次 JSON 体 / 表单字段）；令牌不符或缺令牌、
+    终态任务分别回 `403 {"ok": false, "reason": "not_lessee" / "already_final"}`
+    （`DELETE /lease` 缺令牌回 `missing_fencing_token`，协议 §4.6）；任务不存在回 `403 gone`。
   · 方法与路径严格：协议里的旧路径（`POST /status`、`POST /heartbeat`、`/received`……）
     一律 404，路径对但方法错回 405。
   · 心跳被撤销时回 `200 {"ok": false, "status": "revoked"}`（不是 403）。
@@ -96,6 +96,7 @@ class FakeTaskServer:
         self._seq = 0
         self._order = 0
         self._rules: list[dict] = []                          # 故障注入
+        self.hooks: list[Callable[[dict], None]] = []         # 请求到达时的回调（测试用）
         self._closing = False
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -283,6 +284,8 @@ class FakeTaskServer:
                "status": None, "t": time.monotonic()}
         with self.lock:
             self.calls.append(rec)
+        for hook in list(self.hooks):
+            hook(rec)
 
         status, body, extra = self._route(h.command, path, rec, raw, jbody, form, files)
         rec["status"] = status
@@ -380,8 +383,12 @@ class FakeTaskServer:
             seq = None if seq is None else str(seq)
         return (wid or None), (seq if seq not in ("",) else None)
 
-    def _fence(self, ctx, require_seq_digits: bool = False):
-        """返回 (task, None) 或 (None, 403 响应三元组)。"""
+    def _fence(self, ctx, is_release: bool = False):
+        """返回 (task, None) 或 (None, 403 响应三元组)。
+
+        无令牌时的 reason：对 `DELETE /lease` 协议明写 `missing_fencing_token`（§4.6）；
+        其它写端点协议没写，这里沿用线上旧服务端的行为——行上有租户而调用方不带令牌 →
+        `not_lessee`（见 docs/worker.md 的协议缺口）。"""
         tid = ctx["m"]["tid"]
         with self.lock:
             t = self.tasks.get(tid)
@@ -389,7 +396,8 @@ class FakeTaskServer:
                 return None, (403, {"ok": False, "reason": "gone"}, None)
             wid, seq = self._token_of(ctx["rec"], ctx["json"], ctx["form"])
             if wid is None and seq is None:
-                return None, (403, {"ok": False, "reason": "missing_fencing_token"}, None)
+                reason = "missing_fencing_token" if is_release else "not_lessee"
+                return None, (403, {"ok": False, "reason": reason}, None)
             if wid is not None and (seq is None or not str(seq).lstrip("-").isdigit()):
                 return None, (403, {"ok": False, "reason": "bad_lease_seq"}, None)
             if wid != t["worker_id"] or int(seq) != t["lease_seq"]:
@@ -522,7 +530,7 @@ class FakeTaskServer:
 
     def _h_release(self, ctx):
         # 协议 §4.6：必须带 fencing（仅请求头，DELETE 无请求体）
-        t, err = self._fence(ctx)
+        t, err = self._fence(ctx, is_release=True)
         if err:
             return err
         with self.cond:

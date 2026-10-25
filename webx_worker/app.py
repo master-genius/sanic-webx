@@ -8,9 +8,12 @@ Worker 主程序 — 多 Lane 并发版（`python -m webx_worker [run]`）
   - 能力声明 = CHANNELS 的键（task_type）经 Lane 映射，随每次领取请求带给服务端
 
 启动顺序（同一 asyncio.run 入口）：
-  1. 构建 LaneManager + executor
-  2. 启动领取分发循环 + 后台清理
-  3. 收到 SIGTERM/SIGINT：先同步捕获令牌 → 同步取消在跑任务 → 用捕获的令牌归还租约
+  1. 构建 LaneManager（空 LANES → 单 Lane）
+  2. PendingReporter（失败上报的持久重放队列）+ IPC server（接子进程的失败事件）
+  3. 启动恢复：灌回上次 snapshot，再扫工作目录的 ok.json 与服务端协商（Recovery）
+  4. 拉起 uploader 子进程，启动领取分发循环 + 后台清理
+  5. 收到 SIGTERM/SIGINT：先同步捕获令牌 → 同步取消在跑任务 → 用捕获的令牌归还租约，
+     然后停 uploader、落 PendingReporter 快照
 """
 
 import argparse
@@ -39,11 +42,15 @@ from .config import (
 from .executor import GenericTaskExecutor
 from .heartbeat import HeartbeatManager
 from .http_file_client import http_file_client
+from .ipc_server import IPCServer
 from .lane_manager import LaneManager
 from .link_health import selfcheck_and_report
 from .log_config import setup_logging
 from .log_writer import ConcurrentLogWriter, build_redact_roots
+from .pending_reporter import PendingReporter, set_global_reporter
 from .plugin import TaskKindPlugin
+from .recovery import WorkerRecovery
+from .uploader_supervisor import UploaderSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +195,7 @@ async def async_main(
     plugin: TaskKindPlugin | None = None,
     script_root: str | Path | None = None,
 ):
-    """统一异步入口：dispatcher + Lane workers + 收尾。"""
+    """统一异步入口：Recovery + IPC server + PendingReporter + dispatcher + Lane workers。"""
 
     # 兜底：捕获事件循环内未处理异常，记入日志（后台服务排障刚需）
     def _loop_exc_handler(loop, context):
@@ -232,8 +239,25 @@ async def async_main(
     # 1. 构建 LaneManager（空 LANES → 所有已声明 channel 归入一条 Lane）
     lane_manager = LaneManager(lanes, channel_types=channels.keys())
 
+    # 2. 构建 PendingReporter（汇报失败事件的后台队列消费者）
+    #    需在 executor 之前构建，因为 callback 失败时会通过全局函数访问它
     work_base = Path(worker_settings.WORK_DIR)
     work_base.mkdir(parents=True, exist_ok=True)
+    pending_reporter = PendingReporter(
+        callback=callback_client,
+        work_base_dir=worker_settings.WORK_DIR,
+    )
+    set_global_reporter(pending_reporter)
+
+    # 3. 启动 IPC server（接子进程通过 send_report 发来的失败事件）
+    ipc_sock_path = work_base / "ipc.sock"
+    ipc_server = IPCServer(sock_path=ipc_sock_path, reporter=pending_reporter)
+    await ipc_server.start()
+
+    # 4. 启动恢复：先把上次 snapshot + 各任务降级文件灌回队列
+    restored = await pending_reporter.restore_from_snapshot()
+    if restored:
+        logger.info(f"[Main] PendingReporter 启动恢复 {restored} 条历史事件")
 
     # 内部回调链路自检：把 TLS + 路由 + token 探通一次。
     # 证书/令牌/反代这类开机就存在的故障，不自检则要等"任务投递之后"才暴露
@@ -245,13 +269,30 @@ async def async_main(
         selfcheck_and_report(callback_client), name="link-selfcheck"
     )
 
-    # 2. 构建 executor
+    # 5. 构建 executor（注入 ipc_sock_path 给子进程）
     executor = build_executor(
-        channels, conda_root, plugin=plugin, script_root=script_root,
+        channels, conda_root, ipc_sock_path=str(ipc_sock_path),
+        plugin=plugin, script_root=script_root,
     )
 
-    # 3. 构建 handlers 并启动领取分发
+    # 6. 执行 Recovery（启动恢复扫描 ok.json）
+    recovery = WorkerRecovery(
+        callback=callback_client,
+        work_base_dir=worker_settings.WORK_DIR,
+        plugin=plugin,
+    )
+    await recovery.recover()
+
+    # 6.5 拉起 uploader 子进程（大产物异步上传，让 Lane 提前释放）。
+    #     刻意放在 recover() 之后：恢复扫描可能重排产物，先把队列现场理清再开传。
+    #     它自己扫磁盘队列，父进程不与它通信——拉起、看住、退出时收走，仅此三件事。
+    uploader_sup = UploaderSupervisor()
+    uploader_sup.start()
+
+    # 7. 构建 handlers 并启动领取分发 + PendingReporter consumer
     handlers = build_handlers(executor, channels)
+
+    reporter_task = asyncio.create_task(pending_reporter.run_loop(), name="pending_reporter")
 
     try:
         # run_worker 起成 task 才能被取消——它自己 `except CancelledError` 之后会
@@ -299,6 +340,8 @@ async def async_main(
             worker_task.cancel()
             await asyncio.gather(worker_task, return_exceptions=True)
     finally:
+        # uploader 先停：给它宽限期把在途分片落盘，传不完的下次启动接着传
+        await uploader_sup.stop()
         # 自检是后台观测任务：退出时取消，绝不让它拖住关闭流程
         if not selfcheck_task.done():
             selfcheck_task.cancel()
@@ -309,6 +352,22 @@ async def async_main(
 
         # 停止所有心跳
         await executor.heartbeat.shutdown_all()
+
+        # 优雅停止 PendingReporter + IPC server，并 snapshot 当前队列
+        pending_reporter.request_stop()
+        reporter_task.cancel()
+        try:
+            await reporter_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+        await ipc_server.close()
+
+        # 把内存里没处理完的事件 dump 到文件（排除 fail_task）
+        try:
+            pending_reporter.snapshot_to_file()
+        except Exception as e:
+            logger.error(f"[Main] PendingReporter snapshot 失败: {e}", exc_info=True)
 
 
 def main(argv: list[str] | None = None):

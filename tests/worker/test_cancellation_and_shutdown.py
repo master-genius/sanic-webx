@@ -9,14 +9,12 @@
 """
 
 import asyncio
-import os
 import signal
-import subprocess
 import sys
-import textwrap
 import time
 
 import pytest
+from helpers import channels_for, launch_worker
 
 from webx_worker import heartbeat as hb_mod
 from webx_worker import lease as lease_mod
@@ -263,35 +261,6 @@ def test_shutdown_order_in_app_is_capture_cancel_release():
 
 # ───────────────────────── 真信号 e2e ─────────────────────────
 
-_BOOT = textwrap.dedent("""
-    import sys
-    import webx_worker.heartbeat as h
-    h._HEARTBEAT_INTERVALS = (0.2,)
-    from webx_worker.app import main
-    main(sys.argv[1:])
-""")
-
-
-def _launch_worker(tmp_path, server, channels_py: str, extra_env=None):
-    home = tmp_path / "home"
-    (home / "channel_config").mkdir(parents=True)
-    (home / "channel_config" / "e2e.py").write_text(channels_py, encoding="utf-8")
-    env = {
-        **os.environ,
-        "WEBX_WORKER_WEB_BASE_URL": server.url, "WEBX_WORKER_INTERNAL_TOKEN": server.token,
-        "WEBX_WORKER_STORAGE_URL": server.url, "WEBX_WORKER_LEASE_HOLD_SECONDS": "1",
-        "WEBX_WORKER_WORK_DIR": str(tmp_path / "work"), "WEBX_WORKER_PREFIX": "sigbox",
-        "WEBX_WORKER_UPLOADER_ENABLED": "false",
-        **(extra_env or {}),
-    }
-    from webx_worker._paths import PACKAGE_PARENT
-
-    env["PYTHONPATH"] = PACKAGE_PARENT
-    return subprocess.Popen(
-        [sys.executable, "-c", _BOOT, "--home", str(home), "--config", "e2e"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-
 
 @pytest.mark.skipif(sys.platform == "win32", reason="依赖 POSIX 信号")
 def test_sigterm_end_to_end_releases_lease_and_does_not_fail_the_task(tmp_path, server):
@@ -300,16 +269,11 @@ def test_sigterm_end_to_end_releases_lease_and_does_not_fail_the_task(tmp_path, 
     顺带端到端验证了「空 LANES」（channel 配置里没有 LANES）：worker 能领到任务。
     """
     pidfile = tmp_path / "child.pid"
-    channels = textwrap.dedent(f"""
-        import sys
-        CHANNELS = {{"hang": {{"script": {str(tmp_path / 'hang.py')!r}, "env": "",
-                              "executor": {sys.executable!r}}}}}
-    """)
     (tmp_path / "hang.py").write_text(
         f"import os, time\nopen({str(pidfile)!r}, 'w').write(str(os.getpid()))\ntime.sleep(120)\n"
     )
     tid = server.add_task("hang")
-    proc = _launch_worker(tmp_path, server, channels)
+    proc = launch_worker(tmp_path, server, channels_for(tmp_path / "hang.py", "hang"))
     try:
         assert server.wait_for(lambda: server.task(tid)["status"] == "running", timeout=30), \
             proc.stdout.read() if proc.poll() is not None else "任务没有开始运行"
