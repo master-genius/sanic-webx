@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -40,6 +41,23 @@ from webx.paths import project_root, resolve_path
 # 必须在 import 本模块【之前】调用 configure_root()（见 webx.paths）。
 env = Env()
 env.read_env(path=str(project_root() / ".env"), recurse=False)
+
+
+def _sms_templates_from_env() -> dict[str, str]:
+    """「业务场景 → 模板码」映射，JSON 形如 ``{"verify_code": "SMS_123456789"}``。
+
+    解析失败（缺失 / 非法 JSON / 非对象）一律回退空 dict：配置写坏不该让整个应用
+    起不来——缺模板会在真正发送时以明确的 SmsError(template_not_configured) 报出，
+    比启动期崩溃更容易定位。
+    """
+    raw = env.str("SMS_TEMPLATES", "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return {}
+    return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
 
 
 @dataclass
@@ -191,6 +209,32 @@ class BaseSettings:
     MAIL_USE_SSL: bool = field(default_factory=lambda: env.bool("MAIL_USE_SSL", False))
     MAIL_USE_TLS: bool = field(default_factory=lambda: env.bool("MAIL_USE_TLS", True))
     MAIL_DEFAULT_SENDER: str = field(default_factory=lambda: env.str("MAIL_DEFAULT_SENDER", ""))
+
+    # ==================== 短信（适配层见 webx.lib.sms）====================
+    # 总开关。判断是否真正可用请一律用 ``webx.lib.sms.is_ready()``（= 开关 + 驱动凭证
+    # 齐备），不要直读本字段：开关开了但凭证没配是「半启用」态。
+    # 默认开启——没配凭证时 is_ready() 仍为 False，手机号入口照常提示「暂未开通」；
+    # 要明确关掉短信就置 false。
+    SMS_ENABLED: bool = field(default_factory=lambda: env.bool("SMS_ENABLED", True))
+    # 驱动名，对应 webx.lib.sms.register_driver 注册的名字（内置 aliyun）
+    SMS_PROVIDER: str = field(default_factory=lambda: env.str("SMS_PROVIDER", "aliyun"))
+    # 凭证与签名。字段名沿用 deepmice-api，.env 可直接复用；各驱动按需取用
+    SMS_ACCESS_KEY_ID: str = field(default_factory=lambda: env.str("SMS_ACCESS_KEY_ID", ""))
+    SMS_ACCESS_KEY_SECRET: str = field(default_factory=lambda: env.str("SMS_ACCESS_KEY_SECRET", ""))
+    SMS_SIGN_NAME: str = field(default_factory=lambda: env.str("SMS_SIGN_NAME", ""))
+    # 为空时用驱动默认接入点，仅私网代理 / 联调场景需覆盖
+    SMS_ENDPOINT: str = field(default_factory=lambda: env.str("SMS_ENDPOINT", ""))
+    # 号码区号：业务侧存裸号，发送时由驱动补前缀，⚠️ 绝不回写 DB
+    SMS_DEFAULT_COUNTRY_CODE: str = field(
+        default_factory=lambda: env.str("SMS_DEFAULT_COUNTRY_CODE", "86")
+    )
+    # 业务场景 → 模板码映射（JSON），新增场景只加配置不改代码
+    SMS_TEMPLATES: dict[str, str] = field(default_factory=_sms_templates_from_env)
+    # 双超时：httpx 的 read 是【空闲超时】（块间间隔）而非总时长，只能当卡死探测用；
+    # 「整体不超过 N 秒」须另用 asyncio.timeout 包一层，故 TOTAL 必须 > READ。
+    SMS_CONNECT_TIMEOUT_MS: int = field(default_factory=lambda: env.int("SMS_CONNECT_TIMEOUT_MS", 5000))
+    SMS_READ_TIMEOUT_MS: int = field(default_factory=lambda: env.int("SMS_READ_TIMEOUT_MS", 10000))
+    SMS_TOTAL_TIMEOUT_MS: int = field(default_factory=lambda: env.int("SMS_TOTAL_TIMEOUT_MS", 20000))
 
     # ==================== 派生属性 ====================
 

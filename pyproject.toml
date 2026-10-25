@@ -13,11 +13,11 @@ dependencies = [
     "environs>=15.0.1",
     # DTO 校验：sanic_ext.validate 的后端
     "pydantic>=2.13.4",
+    # 短信适配层（webx/lib/sms）的 HTTP 客户端；手机号是基础能力，故为主依赖
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
-# 短信网关（webx/lib/sms.py）需要 httpx
-sms = ["httpx>=0.28.1"]
 # 开发/测试
 dev = ["pytest>=8", "pytest-asyncio>=1", "sanic-testing>=24"]
 

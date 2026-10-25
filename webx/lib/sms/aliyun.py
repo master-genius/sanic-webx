@@ -1,8 +1,4 @@
-"""短信发送网关（阿里云国内短信 dysmsapi 2017-05-25，httpx 直连，零新依赖）。
-
-用法:
-    from webx.lib.sms import SmsScene, send_scene_sms
-    await send_scene_sms(SmsScene.VERIFY_CODE, "13800138000", {"code": "123456"})
+"""阿里云国内短信驱动（dysmsapi 2017-05-25，httpx 直连，零新依赖）。
 
 为什么不用官方 SDK
 ------------------
@@ -27,14 +23,6 @@
 
 设计要点
 --------
-1. **场景化，而非自由文本**。阿里云短信是模板制的——内容须预先在控制台报备，
-   代码侧只能传 template_code + 参数。故对外暴露的是「业务场景」而非
-   send_sms(to, text)（那是供应商无法兑现的接口）。场景 → 模板码由配置
-   `SMS_TEMPLATES` 驱动，**新增业务场景只加配置、不改代码**。
-
-2. **失败即抛异常**，与 `webx.lib.mail.send_mail` 契约一致：网关不吞错、不重试，
-   失败策略归调用方（验证码服务已有 try/except → SEND_FAILED 分支）。
-
 3. **`Code` 必须显式校验**（最危险的坑）。阿里云的业务失败——余额不足 /
    模板未审核 / 签名不匹配 / 号码黑名单——同样返回 **HTTP 200**，只在响应体里给
    一个非 "OK" 的 `Code`。不判这一项 = 接口报成功、DB 行是 PENDING、
@@ -51,84 +39,17 @@ import hmac
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import StrEnum
 from urllib.parse import quote
 
 import httpx
 
-from webx.config import env, settings
+from webx.config import settings
 from webx.lib.funcs import mask_mobile
+from webx.lib.sms.base import SmsDriver, SmsError
 
 logger = logging.getLogger(__name__)
 
-
-# ==================== 配置混入 ====================
-
-
-def _sms_templates_from_env() -> dict[str, str]:
-    """「业务场景 → 模板码」映射，JSON 形如 ``{"verify_code": "SMS_123456789"}``。
-
-    解析失败（缺失 / 非法 JSON / 非对象）一律回退空 dict：配置写坏不该让整个应用
-    起不来——缺模板会在真正发送时以明确的 SmsError(template_not_configured) 报出，
-    比启动期崩溃更容易定位。
-    """
-    raw = env.str("SMS_TEMPLATES", "").strip()
-    if not raw:
-        return {}
-    try:
-        value = json.loads(raw)
-    except Exception:
-        return {}
-    return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
-
-
-@dataclass
-class SmsSettingsMixin:
-    """短信相关配置。业务 Settings 继承本 mixin 即可启用本模块::
-
-        @dataclass
-        class Settings(SmsSettingsMixin, BaseSettings):
-            ...
-
-    框架核心不含这些字段——不发短信的项目不该被迫携带阿里云配置。
-    """
-
-    # 总开关。判断是否真正可用请一律用 `sms_ready`，见其 docstring。
-    SMS_ENABLED: bool = field(default_factory=lambda: env.bool("SMS_ENABLED", False))
-    # 供应商标识，预留多供应商切换接缝（当前仅 aliyun 有实现）
-    SMS_PROVIDER: str = field(default_factory=lambda: env.str("SMS_PROVIDER", "aliyun"))
-    SMS_ACCESS_KEY_ID: str = field(default_factory=lambda: env.str("SMS_ACCESS_KEY_ID", ""))
-    SMS_ACCESS_KEY_SECRET: str = field(default_factory=lambda: env.str("SMS_ACCESS_KEY_SECRET", ""))
-    SMS_SIGN_NAME: str = field(default_factory=lambda: env.str("SMS_SIGN_NAME", ""))
-    # 为空时使用默认接入点，仅私网代理场景需覆盖
-    SMS_ENDPOINT: str = field(default_factory=lambda: env.str("SMS_ENDPOINT", ""))
-    # 号码区号：业务侧存裸号，发送时由本模块补前缀，⚠️ 绝不回写 DB
-    SMS_DEFAULT_COUNTRY_CODE: str = field(
-        default_factory=lambda: env.str("SMS_DEFAULT_COUNTRY_CODE", "86")
-    )
-    SMS_TEMPLATES: dict[str, str] = field(default_factory=_sms_templates_from_env)
-    # 双超时：httpx 的 read 是【空闲超时】（块间间隔）而非总时长，只能当卡死探测用；
-    # 「整体不超过 N 秒」须另用 asyncio.timeout 包一层，故 TOTAL 必须 > READ。
-    SMS_CONNECT_TIMEOUT_MS: int = field(default_factory=lambda: env.int("SMS_CONNECT_TIMEOUT_MS", 5000))
-    SMS_READ_TIMEOUT_MS: int = field(default_factory=lambda: env.int("SMS_READ_TIMEOUT_MS", 10000))
-    SMS_TOTAL_TIMEOUT_MS: int = field(default_factory=lambda: env.int("SMS_TOTAL_TIMEOUT_MS", 20000))
-
-    @property
-    def sms_ready(self) -> bool:
-        """短信是否真正可用（总开关 + 凭证 + 签名齐备）。
-
-        与 `SMS_ENABLED` 刻意分离：开关开了但 AK/SK 或签名没配是「半启用」态，
-        会让请求穿过端点闸门、白写一行记录占掉当日额度后才失败。所有 SMS 前置
-        判断一律用本属性，不要直接读 SMS_ENABLED。
-        """
-        return bool(
-            self.SMS_ENABLED
-            and self.SMS_ACCESS_KEY_ID
-            and self.SMS_ACCESS_KEY_SECRET
-            and self.SMS_SIGN_NAME
-        )
 
 # ==================== 协议常量 ====================
 
@@ -157,39 +78,6 @@ _RETRYABLE_CODES = frozenset({
     "Throttling.Api",
 })
 
-
-class SmsScene(StrEnum):
-    """短信业务场景。
-
-    枚举值 = `SMS_TEMPLATES` 配置里的 key。新增场景：
-      ① 这里加一个成员；② 控制台报备模板；③ .env 的 SMS_TEMPLATES 加一条映射。
-    业务代码只认场景名，模板码变更（换模板 / 换供应商）不影响任何调用点。
-    """
-
-    VERIFY_CODE = "verify_code"    # 验证码（登录 / 注册 / 变更 / 绑定共用）
-
-
-class SmsError(Exception):
-    """短信发送失败。
-
-    Attributes:
-        code:       供应商响应码或本模块的内部错误码，便于日志聚合与告警分类
-        request_id: 阿里云请求 ID，向工单提供的唯一凭据
-        retryable:  是否值得重试（瞬时故障 True / 业务性拒绝 False）
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        code: str = "",
-        request_id: str = "",
-        retryable: bool = False,
-    ) -> None:
-        super().__init__(message)
-        self.code = code
-        self.request_id = request_id
-        self.retryable = retryable
 
 
 # ==================== 签名（纯函数，可单测 / 可与 SDK 做差分验证）====================
@@ -282,13 +170,16 @@ def _normalize_to(mobile: str) -> str:
     return raw if raw.startswith(cc) else f"{cc}{raw}"
 
 
-async def send_sms(
+async def _send(
     to: str,
     template_code: str,
     params: dict | None = None,
     validity_period: int | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> str:
-    """按模板码发送短信（底层原语，一般用 send_scene_sms）。
+    """调用一次阿里云 SendSms。
+
+    ``transport`` 仅供测试注入（httpx.MockTransport），生产路径不传。
 
     Args:
         to:              手机号（裸号即可，内部自动补区号）
@@ -302,9 +193,9 @@ async def send_sms(
     Raises:
         SmsError: 未配置 / 网络异常 / 超时 / 供应商返回非 "OK"
     """
-    if not settings.sms_ready:
+    if not is_configured():
         raise SmsError(
-            "短信服务未启用或配置不完整（需 SMS_ENABLED + AK/SK + 签名）",
+            "阿里云短信配置不完整（需 SMS_ACCESS_KEY_ID / SMS_ACCESS_KEY_SECRET / SMS_SIGN_NAME）",
             code="not_configured",
         )
     if not template_code:
@@ -356,6 +247,7 @@ async def send_sms(
         # 双超时：asyncio.timeout 卡总时长，httpx.Timeout 只做卡死探测（详见模块 docstring）
         async with asyncio.timeout(settings.SMS_TOTAL_TIMEOUT_MS / 1000):
             async with httpx.AsyncClient(
+                transport=transport,
                 timeout=httpx.Timeout(
                     settings.SMS_READ_TIMEOUT_MS / 1000,
                     connect=settings.SMS_CONNECT_TIMEOUT_MS / 1000,
@@ -403,24 +295,36 @@ async def send_sms(
     return message_id
 
 
-async def send_scene_sms(
-    scene: SmsScene | str,
-    to: str,
-    params: dict | None = None,
-    validity_period: int | None = None,
-) -> str:
-    """按业务场景发送短信（对外主入口）。
 
-    场景 → 模板码经 `settings.SMS_TEMPLATES` 解析，业务代码无需知道模板码。
+def is_configured() -> bool:
+    """阿里云所需凭证与签名是否齐备（不含总开关，总开关归网关管）。"""
+    return bool(
+        settings.SMS_ACCESS_KEY_ID
+        and settings.SMS_ACCESS_KEY_SECRET
+        and settings.SMS_SIGN_NAME
+    )
 
-    Raises:
-        SmsError: 场景未配置模板码，或底层发送失败
+
+class AliyunSmsDriver(SmsDriver):
+    """阿里云国内短信驱动。
+
+    ``transport`` 供测试注入 ``httpx.MockTransport``，让请求构造、签名头与响应判定
+    不走真实网络也能被覆盖。
     """
-    scene_key = str(scene)
-    template_code = settings.SMS_TEMPLATES.get(scene_key, "")
-    if not template_code:
-        raise SmsError(
-            f"短信场景 {scene_key} 未配置模板码，请在 SMS_TEMPLATES 中登记",
-            code="template_not_configured",
-        )
-    return await send_sms(to, template_code, params, validity_period)
+
+    name = "aliyun"
+
+    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self._transport = transport
+
+    def is_configured(self) -> bool:
+        return is_configured()
+
+    async def send(
+        self,
+        to: str,
+        template_code: str,
+        params: dict | None = None,
+        validity_period: int | None = None,
+    ) -> str:
+        return await _send(to, template_code, params, validity_period, self._transport)
