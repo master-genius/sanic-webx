@@ -21,7 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # 开发/测试
-dev = ["pytest>=8", "pytest-asyncio>=1", "sanic-testing>=24"]
+dev = ["pytest>=8", "pytest-asyncio>=1", "sanic-testing>=24", "pyflakes>=3"]
 
 [tool.uv]
 # 关键：只装依赖，不把本仓库当成包去构建安装。

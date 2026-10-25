@@ -33,6 +33,8 @@ import ast
 import collections
 import pathlib
 
+import pytest
+
 # 自底向上，索引即层级；下层不得 import 上层
 LAYER_ORDER = [
     "paths",
@@ -141,3 +143,54 @@ def test_core_no_longer_owns_middleware():
     assert not (WEBX_ROOT / "core" / "middleware.py").exists(), (
         "core/middleware.py 又出现了：中间件应放在 webx/middleware/，一个中间件一个模块"
     )
+
+
+# ==================== 卫星包：与核心的依赖方向 ====================
+#
+# webx 核心之外的独立部署单元（存储服务、worker）。方向是单向的：
+#   webx_storage → webx          （存储服务复用核心的存储原语 / 配置 / 应用工厂）
+#   webx 核心    ↛ 任何卫星包
+#   webx_worker  ↛ webx*         （worker 要能单独打包成客户端，不得带上服务端框架）
+
+REPO_ROOT = WEBX_ROOT.parent
+
+
+def _imports_of(path: pathlib.Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            out.add(node.module)
+        elif isinstance(node, ast.Import):
+            out.update(alias.name for alias in node.names)
+    return out
+
+
+def _top(module: str) -> str:
+    return module.split(".")[0]
+
+
+def test_core_does_not_depend_on_satellite_packages():
+    satellites = {"webx_storage", "webx_worker"}
+    offenders = [
+        f"{p.relative_to(REPO_ROOT)} → {m}"
+        for p in WEBX_ROOT.rglob("*.py")
+        for m in _imports_of(p)
+        if _top(m) in satellites
+    ]
+    assert not offenders, "webx 核心不得依赖卫星包:\n  " + "\n  ".join(offenders)
+
+
+def test_worker_is_fully_independent_of_the_server_framework():
+    """webx_worker 只许用标准库与 httpx：它要能单独打包给没有服务端框架的机器。"""
+    worker = REPO_ROOT / "webx_worker"
+    if not worker.exists():
+        pytest.skip("webx_worker 尚未引入")
+    offenders = [
+        f"{p.relative_to(REPO_ROOT)} → {m}"
+        for p in worker.rglob("*.py")
+        for m in _imports_of(p)
+        if _top(m) in {"webx", "webx_storage", "sanic", "tortoise", "sanic_ext", "environs"}
+    ]
+    assert not offenders, "webx_worker 必须完全独立:\n  " + "\n  ".join(offenders)
+

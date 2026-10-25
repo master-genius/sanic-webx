@@ -14,6 +14,7 @@ from sanic.request import Request
 from sanic.response import json
 
 from webx.i18n import get_lang_from_header, t
+from webx.services.storage_http import decode_param
 from webx.services.storage_service import storage_service
 
 public_file_bp = Blueprint("webx_public_file", url_prefix="/public/files")
@@ -27,7 +28,7 @@ async def download_signed(request: Request, bucket: str, filename: str):
     对公开端点是不必要的信息泄露。
     """
     lang = get_lang_from_header(request.headers)
-    key = f"{bucket}/{filename}"
+    key = f"{decode_param(bucket)}/{decode_param(filename)}"
 
     if not storage_service.verify_sign(request.args.get("sign", ""), key):
         return json({"error": t("not_found", lang)}, status=404)
@@ -47,7 +48,7 @@ async def download_signed(request: Request, bucket: str, filename: str):
 @public_file_bp.head("/<bucket:str>/<filename:str>")
 async def head_signed(request: Request, bucket: str, filename: str):
     """签名链接的 HEAD 探测。签名无效同样回 404。"""
-    key = f"{bucket}/{filename}"
+    key = f"{decode_param(bucket)}/{decode_param(filename)}"
     if not storage_service.verify_sign(request.args.get("sign", ""), key):
         return json({}, status=404)
     path = storage_service.store.exists(key)

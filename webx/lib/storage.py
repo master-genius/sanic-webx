@@ -39,10 +39,14 @@ class KeyRule:
     可配的只有字符集与单段长度。
     """
 
-    def __init__(self, name: str, pattern: re.Pattern[str], max_bytes: int = 255):
+    def __init__(
+        self, name: str, pattern: re.Pattern[str], max_bytes: int = 255, max_depth: int = 16
+    ):
         self.name = name
         self.pattern = pattern
         self.max_bytes = max_bytes
+        #: 键最多几段。不设上限的话，一个请求就能让服务端建出任意深的目录树
+        self.max_depth = max_depth
 
     def check(self, seg: str) -> bool:
         if seg in (".", "..") or seg.startswith("."):
@@ -100,6 +104,9 @@ def normalize_key(key: str, rule: KeyRule | None = None) -> str:
     segments = [s for s in key.replace("\\", "/").split("/") if s]
     if not segments:
         raise StoreError(f"非法对象键: {key!r}", status=400)
+
+    if len(segments) > rule.max_depth:
+        raise StoreError(f"对象键层级过深（最多 {rule.max_depth} 段）", status=400)
 
     for seg in segments:
         if not rule.check(seg):
@@ -272,6 +279,25 @@ class ObjectWriter:
         self._closed = True
 
         os.replace(self._tmp, final_path)  # 同目录 rename，原子
+        logger.info("对象已保存(流式): %s (%d bytes)", final_path, self.size)
+        return final_path
+
+    def finalize_to(self, key: str) -> Path:
+        """原子落位到**任意**对象键（目标目录不必是写入器创建时的前缀目录）。
+
+        用于键要等整个请求解析完才知道的场景（如表单字段 ``key`` 排在文件之后）：
+        先用根前缀开写入器，解析完再落到真正的键。tmp 与目标同属一个存储根（同一文件系统），
+        ``os.replace`` 仍然原子。键非法抛 ``StoreError``，调用方负责 ``abort()``。
+        """
+        final_path = self._store.path_for(key)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+        self._fh.close()
+        self._closed = True
+
+        os.replace(self._tmp, final_path)
         logger.info("对象已保存(流式): %s (%d bytes)", final_path, self.size)
         return final_path
 
