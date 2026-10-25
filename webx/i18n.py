@@ -46,6 +46,16 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "username_taken": "用户名已存在",
         "account_forbidden": "账户已被禁用",
         "account_locked": "账户已被锁定，请稍后再试",
+        # 任务
+        "task_not_found": "任务不存在",
+        "task_status_invalid": "非法的任务状态",
+        "task_state_conflict": "任务状态不一致，请勿重复操作",
+        "children_not_ready": "子任务尚未全部完成",
+        "quota_exceeded": "超出配额限制（{scope}：当前 {current}，上限 {limit}）",
+        "invalid_step_name": "步骤名 {step} 不属于任务类型 {task_type}（可选：{allowed}）",
+        "step_not_allowed": "不能从 {current} 推进到 {requested}（允许：{allowed}）",
+        "max_steps_reached": "步骤数已达上限 {max}",
+        "unknown_task_type": "未登记的任务类型：{task_type}",
     },
     "en": {
         "success": "Success",
@@ -65,6 +75,16 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "username_taken": "Username already taken",
         "account_forbidden": "Account disabled",
         "account_locked": "Account locked, please retry later",
+        # tasks
+        "task_not_found": "Task not found",
+        "task_status_invalid": "Invalid task status",
+        "task_state_conflict": "Task state changed concurrently, do not repeat the action",
+        "children_not_ready": "Child tasks are not all finished yet",
+        "quota_exceeded": "Quota exceeded ({scope}: current {current}, limit {limit})",
+        "invalid_step_name": "Step {step} does not belong to task type {task_type} (allowed: {allowed})",
+        "step_not_allowed": "Cannot advance from {current} to {requested} (allowed: {allowed})",
+        "max_steps_reached": "Step count reached the limit {max}",
+        "unknown_task_type": "Unregistered task type: {task_type}",
     },
 }
 

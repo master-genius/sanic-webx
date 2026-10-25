@@ -33,3 +33,6 @@ CLAUDE.md
 
 # uv 锁文件：本仓库不装成包，依赖版本由 pyproject 声明
 uv.lock
+
+# 并行工作的代理 worktree（临时目录，不入库）
+/.claude/

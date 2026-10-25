@@ -28,45 +28,10 @@ import logging
 from sanic import Request
 from sanic.response import json
 
-from webx.i18n import get_lang_from_header, t
+from webx.i18n import get_lang_from_header
+from webx.lib.errors import WebxError
 
 logger = logging.getLogger(__name__)
-
-
-class WebxError(Exception):
-    """业务异常基类。
-
-    Attributes:
-        status: HTTP 状态码。
-        code: 错误码，同时作为 i18n 文案 key。
-        context: 附加字段，既用于渲染文案的占位符，也原样并入响应体供前端分支。
-    """
-
-    status: int = 400
-    code: str = "error"
-
-    def __init__(
-        self,
-        message: str | None = None,
-        *,
-        code: str | None = None,
-        status: int | None = None,
-        **context,
-    ):
-        # code / status 是显式形参而非 context：否则 `raise NotFoundError(code="x")`
-        # 会把 x 塞进 context、而实际错误码仍是类属性，静默给出错误响应。
-        if code is not None:
-            self.code = code
-        if status is not None:
-            self.status = status
-        self.context = context
-        self.message = message
-        super().__init__(message or self.code)
-
-    def to_dict(self, lang: str) -> dict:
-        # 显式 message 优先；否则按 code 渲染本地化文案（context 充当占位符实参）
-        text = self.message or t(self.code, lang, **self.context)
-        return {"error": text, "code": self.code, **self.context}
 
 
 class NotFoundError(WebxError):

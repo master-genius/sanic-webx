@@ -13,6 +13,8 @@ from webx.models.rbac import (
     UserPermission,
     UserRole,
 )
+from webx.models.task import ACTIVE_STATUSES, TERMINAL_STATUSES, SubStatus, Task, TaskStatus
+from webx.models.task_compute_points import TaskComputePoints
 from webx.models.user import User
 from webx.models.verify_code import (
     VerifyCode,
@@ -28,6 +30,8 @@ __all__ = [
     # 验证码
     "VerifyCode", "VerifyCodeState", "VerifyCodeBizType",
     "VerifyCodeChannel", "VerifyCodeReason",
+    # 任务
+    "Task", "TaskStatus", "SubStatus", "TaskComputePoints", "ACTIVE_STATUSES", "TERMINAL_STATUSES",
     # 组织 / 角色 / 权限
     "Organization", "UserOrg", "UserRole",
     "Permission", "RolePermission", "UserPermission",

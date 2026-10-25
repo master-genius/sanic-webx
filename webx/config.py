@@ -243,6 +243,17 @@ class BaseSettings:
     SMS_READ_TIMEOUT_MS: int = field(default_factory=lambda: env.int("SMS_READ_TIMEOUT_MS", 10000))
     SMS_TOTAL_TIMEOUT_MS: int = field(default_factory=lambda: env.int("SMS_TOTAL_TIMEOUT_MS", 20000))
 
+    # ==================== 任务模块 ====================
+    # true = 只有 register_task_type 登记过的类型才能建任务；false（默认）= 未登记按默认单阶段处理
+    TASK_REQUIRE_REGISTERED_TYPES: bool = field(
+        default_factory=lambda: env.bool("TASK_REQUIRE_REGISTERED_TYPES", False)
+    )
+    # 每用户"等待子任务的顶层任务"上限，0=不限，越界按 [0, 100] 钳。等待态不占并发名额，
+    # 所以需要这道独立的堆积闸
+    TASK_WAITING_PARENT_MAX: int = field(
+        default_factory=lambda: env.int("TASK_WAITING_PARENT_MAX", 10)
+    )
+
     # ==================== 派生属性 ====================
 
     @property
