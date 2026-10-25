@@ -34,7 +34,7 @@ from typing import Optional
 from urllib.parse import quote, unquote, urlsplit
 
 from sanic.request import Request
-from sanic.response import json, text
+from sanic.response import json
 
 from webx.config import settings
 from webx.lib.storage import StoreError

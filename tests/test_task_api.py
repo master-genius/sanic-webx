@@ -702,7 +702,6 @@ def test_create_with_submit_that_is_rejected_leaves_no_orphan(client, dsn, types
 
 def test_input_file_upload_during_submit_does_not_pull_the_task_back_to_draft(client, dsn):
     """上传期间任务被提交：结束时不能用旧状态把它写回 DRAFT（任务会从池里消失）。直接对行锁更新函数做断言。"""
-    import asyncio
 
     from webx.controller.api.task import _update_input_files
 
