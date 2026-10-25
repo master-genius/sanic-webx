@@ -145,3 +145,42 @@ def test_payload_follows_the_protocol_task_shape():
     })
     assert p["task_id"] == "t9" and p["steps"] == ["a", "b"] and p["timeout_seconds"] == 5
     assert "expected_output" not in p            # 协议已删除该字段
+
+
+# ───────────────────────── 停机排空（K5 窗口） ─────────────────────────
+
+
+async def test_claims_arriving_during_drain_are_given_back_not_executed(monkeypatch):
+    """停机开始后才返回的长轮询回包：任务已被服务端认领，必须带令牌还回去、不得执行。
+
+    否则它停在 queued，进程退出后没人 ack，只能等 60s 短租约（旧实现的随机失败源）。
+    """
+    import webx_worker.callback as cb
+    from webx_worker import fencing
+
+    calls = []
+
+    class _CB:
+        async def release_lease(self, tid, extra_headers=None):
+            calls.append(("release", tid, dict(extra_headers or {})))
+            return True
+
+    async def acquire(_slots):
+        lease_mod.begin_drain()                 # 模拟：长轮询挂起期间收到 SIGTERM
+        return [dict(_ROW)]
+
+    monkeypatch.setattr(cb, "callback_client", _CB())
+    monkeypatch.setattr(lease_mod.lease_client, "acquire", acquire)
+    monkeypatch.setattr(lease_mod.worker_settings, "WORKER_ID", "w-drain", raising=False)
+    exec_calls = []
+    d = lease_mod.LeaseDispatcher(_FakeLaneManager(), _RecordingExecutor(exec_calls))
+
+    await d.loop()
+
+    assert exec_calls == [], "排空期间不得执行新认领的任务"
+    assert [c[:2] for c in calls] == [("release", "t-1")]
+    hdr = {k.lower(): v for k, v in calls[0][2].items()}
+    assert hdr.get("x-worker-id") == "w-drain" and hdr.get("x-lease-seq") == "7", "归还必须带 fencing 令牌"
+    assert fencing.lease_seq_of("t-1") is None, "令牌用完即注销，不残留"
+    assert not lease_mod._running_tasks
+

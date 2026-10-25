@@ -92,6 +92,8 @@ async def test_happy_path_full_lifecycle(harness, server):
     # 本地完成标记
     ok = harness.ok_json(tid)
     assert ok["status"] == "completed" and ok["server_confirmed"] is True
+    # 令牌随终态标记落盘：崩溃后 recovery 重试 complete 要靠它（否则是无令牌写，必被拒）
+    assert ok["lease_seq"] == 1 and ok["worker_id"] == t["worker_id"], ok
 
 
 async def test_child_without_fencing_env_is_rejected_by_server(harness, server):

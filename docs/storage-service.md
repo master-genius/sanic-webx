@@ -63,6 +63,9 @@ python -m webx_storage verify --url http://127.0.0.1:9010 --token "$STORAGE_INTE
 | POST | `/internal/signatures` | 签发限时签名 `{key, ttl_seconds?}`，可在对象存在之前预签 |
 | GET / HEAD | `/public/objects/<key>?sign=` | 凭签名下载，无需令牌；签名无效一律 404（不泄露存在性） |
 
+成功状态码：创建会话 `201`；`PATCH` 追加分片 `200`（带 `Upload-Offset` 头，无 `204`）；
+`POST .../complete` `200`；创建对象 `201`；删除 `200`。
+
 分片协议（tus 的核心语义）：
 
 ```

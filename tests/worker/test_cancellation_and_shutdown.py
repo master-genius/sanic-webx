@@ -115,6 +115,21 @@ def test_self_fence_uses_monotonic_clock_not_wall_clock(monkeypatch):
     assert mgr.get_cancel_event("t") is None or True       # 未注册时无 Event，不抛即可
 
 
+def test_self_fence_prefers_server_side_remaining_over_skewed_wall_clock(monkeypatch):
+    """本机墙钟快了一小时：若仍按「绝对时刻 − 本机墙钟」算，剩余会是负数，健康任务得不到自熔基准。
+    协议给了 lease_remaining_ms（服务端自己的时钟算的）就必须用它。"""
+    mgr = hb_mod.HeartbeatManager()
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + 3600)
+    mgr._note_renewed("t", {"lease_until": int(real_time() * 1000) + 100_000, "lease_remaining_ms": 100_000})
+    assert "t" in mgr._lease_deadline, "采用了 lease_remaining_ms，不受本机墙钟偏移影响"
+    assert 80 < mgr._lease_deadline["t"] - time.monotonic() < 100
+    # 旧服务端只给绝对时刻：沿用旧算法（偏移会进入判据，K2），行为不变
+    mgr2 = hb_mod.HeartbeatManager()
+    mgr2._note_renewed("t", {"lease_until": int(real_time() * 1000) + 100_000})
+    assert "t" not in mgr2._lease_deadline
+
+
 def test_self_fence_deadline_is_strictly_earlier_than_server_expiry():
     """方向搞反等于没做：worker 必须比服务端更早停下（余量为正）。"""
     mgr = hb_mod.HeartbeatManager()

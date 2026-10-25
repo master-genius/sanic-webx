@@ -67,10 +67,49 @@ async def test_completed_unconfirmed_is_confirmed_when_server_already_completed(
     assert json.loads((d / "ok.json").read_text())["server_confirmed"] is True
 
 
-async def test_known_limitation_complete_retry_has_no_fencing_token(server, rec, harness):
-    """【已知限制·未修】recovery 重试 complete 时注册表是空的（ok.json 没记令牌），
-    按协议强制 fencing，服务端回 403（无令牌 → not_lessee）；只有服务端状态恰好已是
-    completed 才能确认。其余情况保持未确认、留待下次启动。建议修法见 docs/worker.md。"""
+async def test_complete_retry_uses_the_token_recorded_in_ok_json(server, rec, harness):
+    """崩溃后重启：注册表是空的，令牌靠 ok.json 里记下的 worker_id / lease_seq 临时登记。
+    （旧实现重试是无令牌写，按强制 fencing 必被拒，已完成的任务永远停在 running 等租约回收。）"""
+    from webx_worker import fencing
+
+    tid = _running_for_me(server, seq=2)
+    d = _mkdir(harness, tid, ok={
+        "status": "completed", "server_confirmed": False,
+        "worker_id": "test-host-e2e", "lease_seq": 2,
+    })
+    await rec().recover()
+    assert server.task(tid)["status"] == "completed"
+    assert json.loads((d / "ok.json").read_text())["server_confirmed"] is True
+    assert fencing.lease_seq_of(tid) is None, "临时登记用完即注销"
+
+
+async def test_complete_retry_ignores_a_token_recorded_by_another_worker(server, rec, harness):
+    """请求头里的 worker_id 取自当前配置，别的实例留下的令牌拿来也过不了，不登记、保持未确认。"""
+    tid = _running_for_me(server, seq=2)
+    d = _mkdir(harness, tid, ok={
+        "status": "completed", "server_confirmed": False,
+        "worker_id": "some-other-worker", "lease_seq": 2,
+    })
+    await rec().recover()
+    assert server.task(tid)["status"] == "running"
+    assert json.loads((d / "ok.json").read_text())["server_confirmed"] is False
+    assert server.calls_to("POST", r"/complete$")[0]["status"] == 403
+
+
+async def test_complete_retry_with_stale_token_stays_unconfirmed(server, rec, harness):
+    """令牌代次已过期（任务被回收重投过）：服务端拒绝，保持未确认，且不覆盖新一轮。"""
+    tid = _running_for_me(server, seq=5)
+    d = _mkdir(harness, tid, ok={
+        "status": "completed", "server_confirmed": False,
+        "worker_id": "test-host-e2e", "lease_seq": 2,
+    })
+    await rec().recover()
+    assert server.task(tid)["status"] == "running"
+    assert json.loads((d / "ok.json").read_text())["server_confirmed"] is False
+
+
+async def test_complete_retry_without_recorded_token_is_rejected(server, rec, harness):
+    """升级前遗留的 ok.json 没有令牌字段：行为不变（403，留待下次启动）。"""
     tid = _running_for_me(server)
     d = _mkdir(harness, tid, ok={"status": "completed", "server_confirmed": False})
     await rec().recover()

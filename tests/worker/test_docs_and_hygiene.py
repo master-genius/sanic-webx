@@ -36,7 +36,7 @@ def test_documented_env_names_all_exist_in_the_code():
 def test_doc_mentions_every_subcommand_and_protocol_gap_section():
     for sub in ("selftest", "doctor", "service one", "service multi", "cleanup"):
         assert sub in DOC, sub
-    assert "协议缺口与建议" in DOC and "已知限制" in DOC
+    assert "协议缺口的裁定" in DOC and "已知限制" in DOC
 
 
 def test_no_forbidden_names_anywhere():

@@ -270,7 +270,13 @@ class HeartbeatManager:
             self._lease_deadline.pop(task_id, None)
             return
         try:
-            remain_sec = int(lease_until_ms) / 1000.0 - time.time()
+            remaining_ms = data.get("lease_remaining_ms")
+            if remaining_ms is not None:
+                # 服务端在同一事务里用自己的时钟算好的剩余时长：不含任何跨机时钟偏移（协议 G5）
+                remain_sec = int(remaining_ms) / 1000.0
+            else:
+                # 旧服务端只给绝对时刻：本机墙钟减它，时钟偏移会线性进入判据（局限 K2）
+                remain_sec = int(lease_until_ms) / 1000.0 - time.time()
         except (TypeError, ValueError):
             return
         if remain_sec <= 0:

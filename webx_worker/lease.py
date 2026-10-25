@@ -50,6 +50,11 @@ logger = logging.getLogger(__name__)
 # 停机路径上 `__main__` 拿不到 dispatcher 实例（它建在 run_worker 内部）。
 _running_tasks: dict[str, asyncio.Task] = {}
 
+#: 停机排空标志：置位后领取循环不再发请求，且把已经领到手的新任务原样还回去。
+#: 模块级而非挂在 dispatcher 上，因为停机路径（app.async_main）拿不到 dispatcher 实例，
+#: 与 `_running_tasks` / `release_held_leases` 同理。
+_draining = False
+
 # 退避：正常返回立即重连（那是心跳式的常态，不是错误）；只有真出错才退避。
 _BACKOFF_BASE_SEC = 1.0
 _BACKOFF_MAX_SEC = 30.0
@@ -298,6 +303,8 @@ class LeaseDispatcher:
             return
 
         self._running = True
+        global _draining
+        _draining = False
         from .config import lease_filters
 
         lv, mp = lease_filters()
@@ -307,7 +314,7 @@ class LeaseDispatcher:
             lv if lv is not None else "不限", mp if mp is not None else "不限",
         )
 
-        while self._running:
+        while self._running and not _draining:
             idle = self._idle_lanes()
             if not idle:
                 # 满载 = 天然背压。不发请求，任务就安静待在 DB 池里。
@@ -323,6 +330,13 @@ class LeaseDispatcher:
                 continue
 
             tasks = await lease_client.acquire(slots)
+
+            if _draining:
+                # 长轮询在途时开始了停机，回包里仍可能带着刚认领的任务：不执行，立刻还回池。
+                # 否则它会停在 queued，要等 60s 短租约到期才被回收（停机窗口，见 begin_drain）。
+                if tasks:
+                    await _give_back_claimed(tasks)
+                return
 
             if tasks is None:
                 await self._sleep_backoff()
@@ -374,6 +388,40 @@ class LeaseDispatcher:
         实现见模块级的 `release_held_leases`（停机路径要在更早的时刻调它）。
         """
         await release_held_leases()
+
+
+def begin_drain() -> None:
+    """**同步**停止领取新任务。停机收尾的第一步，必须先于令牌捕获 / 取消 / 归还。
+
+    ## 要关掉的窗口
+
+    归还租约要 await；await 期间领取循环仍在运行，空闲 Lane 会把**刚归还的任务又领回来**，
+    回池变成了 queued，而此刻进程马上退出、没人再 ack 它——只能等 60s 短租约到期。
+    每次滚动重启都有概率让一个任务白白多等一分钟。
+
+    只置标志，不取消 dispatcher：真正的取消仍在收尾末尾（`worker_task.cancel()`），
+    这里只保证"从此刻起不会再有新的认领被执行"。
+    """
+    global _draining
+    _draining = True
+
+
+async def _give_back_claimed(tasks: list[dict[str, Any]]) -> None:
+    """排空期间领到的任务：带着刚拿到的令牌原样归还，不执行。"""
+    from .fencing import headers_for, unregister
+
+    tokens: dict[str, dict] = {}
+    for task in tasks:
+        tid = str(task.get("id") or "")
+        if not tid:
+            continue
+        fence_register(tid, int(task.get("lease_seq") or 0))
+        tokens[tid] = headers_for(tid)
+    try:
+        await release_held_leases(tokens)
+    finally:
+        for tid in tokens:
+            unregister(tid)
 
 
 def cancel_running_tasks() -> int:

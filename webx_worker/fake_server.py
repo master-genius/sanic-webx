@@ -473,7 +473,8 @@ class FakeTaskServer:
             return err
         with self.lock:
             t["lease_until"] = int((time.time() + self.heartbeat_lease_seconds) * 1000)
-            return 200, {"ok": True, "lease_until": t["lease_until"]}, None
+            return 200, {"ok": True, "lease_until": t["lease_until"],
+                         "lease_remaining_ms": int(self.heartbeat_lease_seconds * 1000)}, None
 
     def _h_heartbeat(self, ctx):
         tid = ctx["m"]["tid"]
@@ -488,7 +489,8 @@ class FakeTaskServer:
                 return 200, {"ok": False, "status": "revoked", "reason": "not_lessee"}, None
             if t["status"] not in TERMINAL:
                 t["lease_until"] = int((time.time() + self.heartbeat_lease_seconds) * 1000)
-            return 200, {"ok": True, "status": t["status"], "lease_until": t["lease_until"]}, None
+            return 200, {"ok": True, "status": t["status"], "lease_until": t["lease_until"],
+                         "lease_remaining_ms": int(self.heartbeat_lease_seconds * 1000)}, None
 
     def _h_status(self, ctx):
         t, err = self._fence(ctx)

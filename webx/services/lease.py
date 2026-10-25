@@ -231,7 +231,8 @@ UPDATE tasks SET
     updated_at     = now()
 WHERE id = $5 AND worker_id = $6 AND lease_seq = $7
   AND status = ANY($8)
-RETURNING id, status, lease_until
+RETURNING id, status, lease_until,
+          (lease_until - {NOW_MS}) AS lease_remaining_ms
 """
 
 

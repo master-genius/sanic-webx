@@ -380,22 +380,23 @@ python -m webx_worker doctor --home /srv/worker --config gpu0
 空 slots 不可能领到任务）、**回调通道**（`GET /internal/tasks/<哨兵>`：`404`/`200` = 通，`401` = 令牌错）、
 存储服务（`GET /internal/uploads/<哨兵>`：`404` = 通，`401` = 令牌错）。退出码 0/1/2。
 
-## 13. 协议缺口与建议（相对 `worker-protocol.md`）
+## 13. 协议缺口的裁定（相对 `worker-protocol.md`）
 
-实现按文档的**新路径**调用；以下是文档没写清、worker 目前采取保守兼容的地方，建议补写：
+迁移时 worker 对协议里没写清的地方采取了保守兼容。服务端（`webx/controller/internal/`）落地后逐条核对，
+结论都已写进 `worker-protocol.md`；这里只记录裁定，以及 worker 是否因此改了行为：
 
-| # | 缺口 | worker 现行做法 | 建议 |
+| # | 缺口 | 裁定 | worker 侧 |
 |---|---|---|---|
-| G1 | §4.10 `GET /internal/tasks/<id>` 的响应是 `{id,status,…}` 还是 `{"data":{…}}` | 两种都认 | 明写扁平形状 |
-| G2 | `fields`（§4.8）的 `result_path`/`log_path` 是 JSON 字符串还是对象；`deliveries`（§4.9）示例写的是对象 | `fields` 发 JSON 字符串（沿用旧契约）、`deliveries` 发对象（照 §4.9 示例） | 两处统一为对象，或明写“两种都收” |
-| G3 | 写端点**完全缺令牌**时的 `reason`（仅 `DELETE /lease` 写了 `missing_fencing_token`）；`bad_lease_seq` 只在 ack 写了 | 缺令牌条目按“永久拒绝”假设设计（旧服务端回 `not_lessee`）；若服务端回 `missing_fencing_token`，持久重放队列会把它当“保留”→ 缺令牌的条目永远重试 | 规定缺令牌统一回 `not_lessee`；或明确 `missing_fencing_token`/`bad_lease_seq` 在重放里是终态 |
-| G4 | §4 开头“除特别说明外都需要 fencing”与读接口（`GET task`、`GET files`）的关系 | 持有租约时读请求也带令牌（无副作用）；`GET task` 在恢复/uploader 场景下无令牌 | 明写读接口不要求 fencing |
-| G5 | `lease_until` 是**绝对时间戳**，worker 用 `lease_until − 本机墙钟` 算剩余时长，时钟偏移线性进入自熔判据（K2） | 照算 | 心跳响应增加 `lease_remaining_ms`（SQL 里算 `lease_until − now()`） |
-| G6 | 心跳收到 `403`/`404` 时 worker 该怎么处理 | `404` → 取消；`403` 等 → 当作心跳失败，靠自熔兜底 | 规定“不再是租户（403 not_lessee/gone）等价于 revoked”或保证只回 200 |
-| G7 | 没有“无副作用的回调探针”；启动自检/doctor 用 `GET /internal/tasks/<哨兵ID>` 期待 404，哨兵 ID 取 15 位字母数字（旧服务端对 task_id 有形态守卫） | 如述 | 声明 task_id 形态约束，或提供 `GET /internal/ping`（带鉴权） |
-| G8 | `POST /task/leases` 的 `slots: []` 是否一定 `400`（doctor 依赖它做安全探测） | 假设是 | 在 §3.1 明写 |
-| G9 | 存储 `PATCH /internal/uploads/<id>` 成功是 `200` 还是 `204`；`POST .../complete` 是否 `200` | 都接受 200/204、200/201 | storage-service.md 补写状态码 |
-| G10 | `deliveries` 的成功响应码与体 | 200 即成功 | 补写 |
+| G1 | `GET /internal/tasks/<id>` 响应形状 | **扁平对象**，无 `data` 外壳（协议 §4.10） | 两种都认，不用改 |
+| G2 | `fields` 的 `result_path`/`log_path` 是字符串还是对象 | **两种都收**，`deliveries` 同（§4.8） | 不用改 |
+| G3 | 缺令牌时的 `reason` | 写端点统一 `not_lessee`；`bad_lease_seq` / `missing_fencing_token` 是客户端 bug，**重放中不是终态**（§2） | 保持“保留不丢”，不用改 |
+| G4 | 读接口与 fencing 的关系 | **读接口不要求 fencing**（§2） | 不用改 |
+| G5 | `lease_until` 绝对时刻引入时钟偏移 | ack / 心跳响应**新增 `lease_remaining_ms`**（服务端同一事务里算）（§4.1/4.2） | **已改**：优先用它，缺失才回退旧算法（K2 就此解决） |
+| G6 | 心跳被撤销怎么处理 | 撤销回 **200 + `status=revoked`**，任务不存在回 404（§4.2） | 不用改 |
+| G7 | 无副作用的回调探针 | `GET /internal/tasks/<任意 id>` 即探针，id 无形态约束（§4.10） | 不用改 |
+| G8 | `slots: []` 是否一定 400 | **一定**（§3.1），`task_server.verify` 也依赖它 | 不用改 |
+| G9 | 存储接口成功状态码 | 创建 201、PATCH 200、complete 200（`storage-service.md`） | 不用改 |
+| G10 | `deliveries` 成功响应 | `200 {"task_id", "result_path"}`（§4.9） | 不用改 |
 
 ## 14. 已知限制
 
@@ -404,7 +405,7 @@ python -m webx_worker doctor --home /srv/worker --config gpu0
 | # | 内容 |
 |---|---|
 | K1 | **自熔余量（10s）小于心跳检查粒度**：稳定期节拍 29s + 单次超时 10s ⇒ 续租持续失败时检查间隔 39s，最坏在服务端回收后约 29s 才停下，“严格早于”在长任务上不成立。修法需**同时**做两步：sleep 按 deadline 截断、醒来后先判自熔再发心跳。暂不修的理由：被回收的任务重新开跑要经认领→ack→下载输入→拉起子进程，那 ≤29s 通常不会变成两份同时算；若将来引入共享工作目录须重新评估 |
-| K2 | **自熔剩余时长用本机墙钟减服务端绝对时刻**（`lease_until/1000 − time.time()`）：跨机时钟偏移线性进入判据（慢则晚熔、快则早熔把健康任务掐掉）。deadline 本身用 monotonic，只有这一减受影响。根治需协议提供 `lease_remaining_ms`（G5） |
+| K2 | ✅ **已解决**：自熔剩余时长优先取服务端给的 `lease_remaining_ms`（G5），不再把跨机时钟偏移带进判据。仅在对接旧服务端（只给绝对时刻 `lease_until`）时才回退到「绝对时刻 − 本机墙钟」，此时偏移仍会进入判据 |
 | K3 | **recovery 期间收到 SIGTERM 不会与停机竞态**：停止信号的监听在 `recovery.recover()` 之后；恢复扫描是逐目录串行 `GET`（单次超时 30s），服务端不可达时最慢，可能超出 `TimeoutStopSec` 被 SIGKILL，snapshot 随之丢失（改造前同样硬杀，不是回归） |
 | K4 | **recovery 的 rmtree 分支没有归属校验**，且共享工作目录有三处冲突：`ipc.sock` 被后启动者抢占、失败上报 snapshot 互相覆盖、recovery 误删兄弟实例正在执行的任务目录。今天安全仅因每个实例独占工作目录（`derive_worker_id` 取 `--config` 裸名保证 ID 不同）。**多实例务必配互不相同的 `WEBX_WORKER_WORK_DIR`**，且别指向它们的共同父目录 |
 
@@ -412,8 +413,8 @@ python -m webx_worker doctor --home /srv/worker --config gpu0
 
 | # | 内容 |
 |---|---|
-| K5 | **停机窗口**：先归还、后取消领取循环；窗口内领取循环可能把刚归还的任务又领回来（随后由 `run_worker` 的 `release_all` 再归还一次，`lease_seq` 因此可能不止 +1）。若领取响应恰好丢失，靠短租约到期回池 |
-| K6 | **recovery 重试 `complete` 不带 fencing 令牌**：`ok.json` 没记 `lease_seq`，重启后注册表是空的。按协议强制 fencing，这条重试只有在服务端状态恰好已是 `completed` 时才能确认；其余保持未确认。运行期的失败 complete 由 PendingReporter（令牌随条目快照）覆盖，所以实际只影响“崩溃而非优雅停机”的场景。建议修法：`_write_ok_json` 记 `worker_id/lease_seq`，recovery 重试前临时登记令牌 |
+| K5 | ✅ **已解决**（原：停机时先归还、后停领取循环，空闲 Lane 会把刚归还的任务又领回来，停在 queued 等 60s 短租约；`test_sigterm_end_to_end` 约三分之一概率失败即由此而来）。现在停机第一步 `begin_drain()` **同步**停领，长轮询在途期间收到的回包带令牌原样归还、不执行。残余：领取响应本身丢在路上（服务端已认领、worker 没收到）仍只能靠短租约到期回池，这是协议固有的 |
+| K6 | ✅ **已解决**：`ok.json` 现在记 `worker_id` / `lease_seq`，recovery 重试 `complete` 前用它临时登记令牌（用完注销）。只认本实例自己的记录；令牌代次已过期（任务被回收重投过）则服务端拒绝，保持未确认，不会覆盖新一轮。升级前遗留的无令牌 `ok.json` 行为不变 |
 | K7 | `PendingReporter.restore_from_snapshot` 在快照文件不存在时直接 `return 0`，**走不到扫描 per-task 降级文件**（子进程 IPC 不通时写的 `pending_reports.jsonl`）；这些事件只有在恰好存在快照时才会在启动恢复里被重放 |
 | K8 | `PendingReporter._do_post` 在条目无 fencing 时会就地 `pop("_mode")`，使第二次重放丢失 merge 模式（按 overwrite 写）。有令牌的条目走拷贝路径不受影响；无令牌条目按协议本就会被永久拒绝，实际影响面很小。另 `_safe_to_fail` 的 docstring 写“读不到状态则 retry”，实现是 drop |
 | K9 | **uploader 背压未接线**：`UploaderSupervisor.is_backpressured()` / `UPLOADER_PENDING_LIMIT_GB` 在原实现里就没有调用点（领取循环不查积压）。积压撑盘是 uploader 唯一会拖垮机器的失败模式，接入需在 `LeaseDispatcher.loop` 的发请求前判断 |

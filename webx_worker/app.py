@@ -309,7 +309,7 @@ async def async_main(
             worker_task.result()
         else:
             logger.info("[Main] 收到停止信号，开始收尾（**不等待在跑的任务**）")
-            # ── 三步，顺序本身就是判据，一步都不能换 ────────────────────────
+            # ── 先停领取，再三步，顺序本身就是判据，一步都不能换 ────────────────────────
             #
             # 要防的倒退：systemd 按 cgroup 一并 SIGTERM，**在跑任务的子进程同时被杀**。
             # executor 看到的只是「子进程非零退出」，于是走普通失败分支去调 `fail_task`
@@ -325,11 +325,15 @@ async def async_main(
             #    两个请求并发，先后仍是概率问题。有了 ② 才是结构保证。
             # ③ 用捕获到的令牌归还，任务立刻回池等人来领。
             from .lease import (
+                begin_drain,
                 cancel_running_tasks,
                 held_fencing_headers,
                 release_held_leases,
             )
 
+            # ⓪ 先**同步**停掉领取：否则 ③ 的 await 期间，空闲 Lane 会把刚归还的任务又领回来，
+            #    任务停在 queued 等 60s 短租约才回池（见 begin_drain）。
+            begin_drain()
             tokens = held_fencing_headers()
             cancelled = cancel_running_tasks()
             if cancelled:

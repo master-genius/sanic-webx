@@ -38,9 +38,18 @@
 | 任务不存在 / 已软删 | `403 {"ok": false, "reason": "gone"}` |
 | 令牌不是当前租户（过期租户） | `403 {"ok": false, "reason": "not_lessee"}` |
 | 同一租户但任务已在终态 | `403 {"ok": false, "reason": "already_final"}` —— **这是幂等成功**，调用方视为成功后丢弃，不要告警 |
+| **完全没带令牌**（除 `DELETE /lease`） | `403 {"ok": false, "reason": "not_lessee"}`（无论任务当前有没有租户）|
+| 带了 `worker_id` 却没带 / 带坏 `lease_seq` | `403 {"ok": false, "reason": "bad_lease_seq"}` —— 客户端 bug，响亮拒绝，不当作无令牌 |
+| `DELETE /lease` 完全没带令牌 | `403 {"ok": false, "reason": "missing_fencing_token"}` |
 
 为什么是 `403`：它本来就是"业务 / 安全拒绝"，客户端不应重试，也不应触发全局鉴权告警（只有 `401` 才是鉴权故障）。
 worker 的**持久重试队列**对"永不放弃"与"永久拒绝"的区分依据是响应体里的 `reason`，不是状态码。
+**重放时的终态**只有 `not_lessee` / `gone` / `already_final`（再试一万次也是同一个答案，出队）；
+`bad_lease_seq` 与 `missing_fencing_token` 是调用方自己的 bug，不是"租约已丢"，worker 保守保留条目等人处理，
+不要在服务端为了让重放队列"自愈"而把它们改成 `not_lessee`。
+
+**读接口不要求 fencing**：`GET /internal/tasks/<id>`、`GET .../files`、`GET .../files/<name>` 无副作用，
+带不带令牌都行（恢复 / 上传进程场景下本来就没有令牌）。
 
 **例外：心跳**被撤销时回 `200` 而不是 `403`，见 §4.2。
 
@@ -63,6 +72,8 @@ worker 的**持久重试队列**对"永不放弃"与"永久拒绝"的区分依�
 - `max_level` / `max_compute_points`：可选，**上限**语义，是整台 worker 的属性（这台机器服务谁），
   不是每个槽各自的。只缩小候选集，不改变互斥语义。`< 0` 或非整数 → `400`。
 - 缺 `worker_id` → `400 {"error": "worker_id required"}`。
+- **`slots` 为空数组 → 一定是 `400`**。运维探针（`doctor`、`task_server.verify`）靠它做无副作用探测：
+  `400` = 可达且令牌有效，`401` = 令牌错，`404` = 反代没转发这条路由；空 slots 不可能领到任何任务。
 
 流程：先取唤醒事件的当前代次，**再**查库认领（顺序不可颠倒，反过来会丢唤醒）；没有任务就挂起到被戳醒或挂满
 `HOLD_SECONDS`。数据库抖动 → `503 {"error": "claim failed"}`，worker 按退避重连，不要紧密重试。
@@ -112,7 +123,7 @@ worker 的**持久重试队列**对"永不放弃"与"永久拒绝"的区分依�
 
 领到任务后**立即**调用：把短租约续成常规租约。兜住"领取响应丢在路上"的情形。
 
-- 成功 `200 {"ok": true, "lease_until": <毫秒时间戳>}`
+- 成功 `200 {"ok": true, "lease_until": <毫秒时间戳>, "lease_remaining_ms": <毫秒>}`
 - 已不是租户 `403 {"ok": false, "reason": "not_lessee"}` —— worker 应放弃本次执行
 - 带了 `worker_id` 却没带 / 带坏 `lease_seq` → `403 {"ok": false, "reason": "bad_lease_seq"}`（响亮拒绝，不当作无令牌）
 
@@ -121,13 +132,17 @@ worker 的**持久重试队列**对"永不放弃"与"永久拒绝"的区分依�
 续租：`lease_until = now + 常规租约 + grace`，`grace = α × 已投入时长`（下限 180 秒，上限 5 小时），
 **由服务端计算**，所有租约时间运算在 SQL 里用数据库的 `now()`，不用应用侧时钟。
 
-- 成功 `200 {"ok": true, "status": "<任务状态>", "lease_until": <毫秒时间戳>}`
+- 成功 `200 {"ok": true, "status": "<任务状态>", "lease_until": <毫秒时间戳>, "lease_remaining_ms": <毫秒>}`
 - **被撤销 `200 {"ok": false, "status": "revoked", "reason": "not_lessee"}`**（不是 403）
 
 为什么撤销也回 `200`：worker 的取消判据是 `status != "running"`。只要回一个非 `running` 的 status，
 被撤销租约的 worker 会在下一跳自行终止子进程，**无需额外分支**。`lease_until` 是**承重项**：
 grace 随已投入时长变化，租约时长每跳都不同，worker 无法自行推算，必须由服务端每跳告知——
 否则自熔时刻会漂到服务端回收之后（出现"服务端已租给 B、A 仍认为自己持有"的窗口）。
+
+**自熔应使用 `lease_remaining_ms`**：它是服务端在写入租约的同一事务里用**自己的** `now()` 算出的剩余时长，
+不含任何跨机时钟偏移；`lease_until` 是绝对时刻，worker 若用「它 − 本机墙钟」就把时钟偏移线性带进了自熔判据
+（偏慢则晚熔、偏快则把健康任务掐掉）。字段缺失（旧服务端）时才回退到绝对时刻差。
 
 任务不存在 / 已软删：`404 {"ok": false, "reason": "gone"}`（worker 视为 server-gone，终止本次执行）。
 令牌缺失 / 畸形也按"被撤销"答复 `200 + status=revoked`，不 500。
@@ -157,7 +172,8 @@ worker 优雅退出 / 重启恢复时调用，任务立即回 `pending` 池（�
 
 ### 4.8 `PATCH /internal/tasks/<id>/fields?mode=overwrite|merge` —— 结果 / 日志字段
 
-`{"result_path": ..., "log_path": ...}`。`overwrite`（默认）替换整个字段；`merge` 按 key 深度合并
+`{"result_path": ..., "log_path": ...}`，两个字段**既收 JSON 对象也收 JSON 字符串**（库里存 JSON 文本，
+响应里原样回对象）；`deliveries` 同。`overwrite`（默认）替换整个字段；`merge` 按 key 深度合并
 （步骤 key 不存在则添加，存在则 dict-update 子字段）。不改变任务状态。非法 `mode` → `400`。
 这条路严格 fencing——`log_path` 被上一轮覆盖正是要防的事。
 
@@ -167,13 +183,18 @@ worker 优雅退出 / 重启恢复时调用，任务立即回 `pending` 池（�
 手里永远没有 per-task 的租约令牌。多步推进后 `lease_seq` 早已 +1、甚至换了 worker，产物仍要交付，
 所以对它做租户比对除"任务不存在"之外每一种拒绝都是误判。条目写的是带步骤序号的叶子 key，不碰当前轮的字段。
 
-判据只有两条：任务不存在 / 已软删 → `404`（上传进程据此**丢弃**条目，不留僵尸）；其余 → merge 写入。
+判据只有两条：任务不存在 / 已软删 → `404`（上传进程据此**丢弃**条目，不留僵尸）；其余 → `200`
+`{"task_id": ..., "result_path": <合并后>}` 并 merge 写入（`result_path` 缺省则 `200 {"task_id", "message"}` 什么也不写）。
 `log_path` 不在本端点职责内。
 
 ### 4.10 `GET /internal/tasks/<id>` —— 任务信息
 
-供 worker 启动恢复协商状态用：`{id, status, lease_seq, worker_id, task_type, ...}`；不存在 `404`。
-**不返回已软删任务**（否则上传进程会白传已删任务的产物）。
+供 worker 启动恢复协商状态用，**扁平对象**（没有 `data` 外壳）：
+`{id, status, task_type, lease_seq, worker_id, sub_status, sub_step}`；不存在 `404 {"error", "reason": "gone"}`。
+**不返回已软删任务**（否则上传进程会白传已删任务的产物）。task_id 没有形态约束，任意字符串都只是"不存在"。
+
+这也是**无副作用的回调探针**：启动自检 / `doctor` 用一个不存在的哨兵 id 调它，`404` = 路由通且令牌有效，
+`401` = 令牌错（内部组的鉴权中间件先于路由）。
 
 ### 4.11 `GET /internal/tasks/<id>/files` 与 `GET /internal/tasks/<id>/files/<name>`
 

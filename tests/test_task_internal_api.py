@@ -137,6 +137,9 @@ def test_full_lifecycle_submit_claim_ack_run_report_complete(client, dsn):
 
     hb = client.post(f"/internal/tasks/{tid}/heartbeats", headers=h)[1]
     assert hb.status == 200 and hb.json["ok"] and hb.json["status"] == "running" and hb.json["lease_until"] > 0
+    # 服务端用自己的时钟在同一事务里算好剩余时长（协议 G5）：常规租约 100s + grace(≥180s)，且不超过 18000s 上限外的量级
+    assert 270_000 <= hb.json["lease_remaining_ms"] <= 100_000 + 18_000_000, hb.json
+    assert 0 < ack.json["lease_remaining_ms"] <= 100_000 + 18_000_000
 
     merged = client.patch(f"/internal/tasks/{tid}/fields?mode=merge", json={"result_path": {"a": {"url": "/x"}}}, headers=h)[1]
     assert merged.status == 200

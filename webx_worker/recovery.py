@@ -27,6 +27,8 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import fencing
+from .config import worker_settings
 from .plugin import TaskKindPlugin
 
 logger = logging.getLogger(__name__)
@@ -128,7 +130,21 @@ class WorkerRecovery:
         if status == "completed":
             # 仅重试状态迁移，result_path/log_path 由任务脚本通过 PATCH /fields 管理
             logger.info(f"[Recovery] task={task_id} 重试 complete 回调")
-            success = await self.callback.complete_task(task_id)
+            # 重启后令牌注册表是空的：用 ok.json 里记下的令牌临时登记，重试才不是"无令牌写"。
+            # 只认本实例自己的记录（请求头里的 worker_id 取自当前配置，别人的令牌拿来也过不了）。
+            seq = ok_data.get("lease_seq")
+            registered = (
+                isinstance(seq, int)
+                and ok_data.get("worker_id") == worker_settings.WORKER_ID
+                and fencing.lease_seq_of(task_id) is None
+            )
+            if registered:
+                fencing.register(task_id, seq)
+            try:
+                success = await self.callback.complete_task(task_id)
+            finally:
+                if registered:
+                    fencing.unregister(task_id)
 
             # 若回调失败，查询服务端实际状态
             if not success:

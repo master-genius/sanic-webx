@@ -31,6 +31,7 @@ from pathlib import Path
 from . import envnames as E
 from ._paths import with_package_on_pythonpath
 from .config import worker_settings
+from .fencing import lease_seq_of as fence_lease_seq_of
 from .log_writer import LineAssembler
 from .plugin import TaskKindPlugin
 
@@ -376,6 +377,12 @@ class GenericTaskExecutor:
             "result_path": result_path,
             "log_path": log_path,
         }
+        # 租约令牌随终态标记落盘：进程崩溃后重启，注册表是空的，recovery 重试 complete 时
+        # 没有它就是无令牌写，按强制 fencing 必被拒（见 recovery 的临时登记）
+        seq = fence_lease_seq_of(task_id)
+        if seq is not None:
+            ok_data["worker_id"] = worker_settings.WORKER_ID
+            ok_data["lease_seq"] = seq
         if server_confirmed:
             ok_data["server_confirmed_at"] = datetime.now(timezone.utc).isoformat()
         if not_found_at:

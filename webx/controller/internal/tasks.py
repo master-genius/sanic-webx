@@ -89,7 +89,8 @@ async def ack_task(request: Request, task_id: str):
         # 已不是租户：多半是领取响应在途时租约就到期回池了，任务可能已归别人。worker 应放弃本次执行
         logger.info("[fence] ack 被拒 task_id=%s caller=%s/%s", task_id, worker_id, seq)
         return json({"ok": False, "reason": REASON_NOT_LESSEE}, status=403)
-    return json({"ok": True, "lease_until": renewed.get("lease_until")})
+    return json({"ok": True, "lease_until": renewed.get("lease_until"),
+                 "lease_remaining_ms": renewed.get("lease_remaining_ms")})
 
 
 @internal_task_bp.post("/<task_id:str>/heartbeats")
@@ -115,7 +116,8 @@ async def create_heartbeat(request: Request, task_id: str):
     renewed = await renew_lease(task_id, worker_id, seq)
     if renewed is None:
         return json({"ok": True, "status": task.status.value})  # 读到写之间状态被改走（如刚被取消）：按当前状态答复
-    return json({"ok": True, "status": task.status.value, "lease_until": renewed.get("lease_until")})
+    return json({"ok": True, "status": task.status.value, "lease_until": renewed.get("lease_until"),
+                 "lease_remaining_ms": renewed.get("lease_remaining_ms")})
 
 
 @internal_task_bp.put("/<task_id:str>/status")
