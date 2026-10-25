@@ -1,7 +1,22 @@
 # webx
 
-面向**纯 Web 服务**的通用 Sanic 框架，从 deepmice-api 的自建体系中抽离、去业务化重构而来。
-不含 worker / 补偿器 / ZMQ —— 那些是计算平台的东西，不是 web 框架的。
+通用 Sanic 服务框架，从 deepmice-api 的自建体系中抽离、去业务化重构而来：
+账号 / 权限 / 文件 / 验证码这些 Web 基础件，加上一套**通用的异步任务调度**（任务模块、领取服务、补偿器、独立存储服务、算力 worker）。
+框架里没有任何具体的业务任务——任务类型由使用方注册，计算由 worker 的 channel 脚本承担。
+
+## 组成与文档
+
+| 部分 | 在哪 | 是什么 | 文档 |
+|---|---|---|---|
+| **webx 核心** | `webx/` | 框架骨架、账号 / 权限 / 文件 / 验证码、**任务模块**（模型、服务、`api` / `admin` / `internal` 三组接口，默认启用） | `docs/task-api.md`、`docs/api-conventions.md` |
+| 领取服务 | `task_server/` | worker 用 HTTP 长连接来领任务的单进程服务 | `docs/task-scheduling.md` |
+| 补偿器 | `tools/reconciler.py` | 租约回收、子任务准入、巡检；全局唯一一份 | `docs/task-scheduling.md` |
+| 存储服务 | `webx_storage/` | 独立部署的对象存储（整传 / 分片 / 签名 / 任务产物策略） | `docs/storage-service.md` |
+| worker | `webx_worker/` | 算力节点：拉取任务、执行 channel 脚本、上传产物。**完全独立**（仅标准库 + httpx），可单独打包 | `docs/worker.md`、`docs/worker-protocol.md` |
+| 部署与验证 | `deploy/`、`server.sh`、`tools/smoke.py` | systemd 单元、角色化启动、上线冒烟 | `deploy/README.md`、`docs/verification.md`、`docs/testing.md` |
+
+依赖方向（由 `tests/test_layering.py` 焊死）：webx 核心**不依赖** `webx_storage` / `webx_worker`；`webx_storage` 可以依赖 webx 的基础服务；
+`webx_worker` 不 import webx 的任何东西——两边只通过 `docs/worker-protocol.md` 定义的 HTTP 协议对话。
 
 ## 能力清单
 
@@ -20,9 +35,10 @@
 |---|---|
 | `controller/auth/` | 账密登录注册、管理员登录、验证码登录、找回密码、登出、刷新令牌 |
 | | 注册与找回都是**邮箱/手机二选一**；短信未配置或被关闭时自动挡住手机路径 |
-| `controller/api/` | 个人中心 + 文件：上传（整传/分片）、下载、签发限时链接、删除 |
-| `controller/admin/` | 账号 CRUD、角色/权限查询、用户角色管理、单独授权 |
+| `controller/api/` | 个人中心 + 文件（整传 / 分片 `/api/uploads`、下载、签发限时链接 `…/signatures`、删除）+ **任务**（`/api/tasks`：创建、编辑、提交、取消、重试…） |
+| `controller/admin/` | 账号 CRUD、角色/权限查询、用户角色管理、单独授权、全站任务列表与计数 |
 | `controller/public/` | 签名下载（无需登录，靠限时签名授权） |
+| `controller/internal/` | **服务间回调**（worker → web，`/internal/tasks/<id>/…`）；整组由 `X-Internal-Token` 鉴权，令牌未配置则全拒 |
 
 内置路由**走的是同一套 `__mid__.py` 扫描机制**，没有任何特殊待遇——
 每个目录自己声明中间件，`create_app` 一并扫描。不需要就 `builtin_controller=False`。
@@ -129,6 +145,12 @@ python run.py --dev                       # 开发：单进程，好断点
 ./server.sh --dev --workers 1             # 同上，但走 sanic CLI（热重载）
 ./server.sh --workers 4                   # 生产：4 个 worker，崩了自动重启
 ./server.sh --port 9000 --modules app,appx  # 指定端口与装配的业务模块
+
+# 其它角色同一个入口（不写角色 = web）：
+./server.sh task                          # 领取服务（单进程）
+./server.sh storage --workers 4           # 存储服务
+./server.sh reconciler                    # 补偿器
+./server.sh worker --home /data/worker    # 算力 worker
 ```
 
 两种入口共用 `run.py` 里的**模块级** `app` 变量：`python run.py` 时
@@ -188,12 +210,20 @@ python run.py --dev                       # 开发：单进程，好断点
 ```
 myproject/
 ├── run.py            启动入口（模块级 app，两种启动方式共用）
-├── server.sh         部署脚本：sanic CLI + 多 worker
+├── server.sh         各角色统一启动脚本（web / task / storage / reconciler / worker）
 ├── .env
+├── deploy/           systemd 单元模板 + 部署说明
+├── docs/             规范与说明文档（任务接口、调度、存储、worker 协议、验证…）
 ├── tools/            运维脚本，直接 python tools/xxx.py 跑
 │   ├── dbsync.py     表结构同步
 │   ├── admin.py      管理员账号
-│   └── org.py        组织与权限初始化
+│   ├── org.py        组织与权限初始化
+│   ├── reconciler.py 补偿器（独立进程）
+│   ├── smoke.py      上线冒烟（提交真实任务走一遍全链路）
+│   └── clear_cache.sh 清 __pycache__
+├── task_server/      领取服务（独立进程，认领 SQL 在 webx/services/claim.py）
+├── webx_storage/     独立存储服务
+├── webx_worker/      算力 worker（完全独立，不 import webx）
 ├── app/              ← 你的业务代码，改这里（自带的 note/welcome 是示例，可直接删）
 │   ├── config.py     class Settings(BaseSettings) + configure_settings()
 │   ├── i18n.py       register("zh", {...})       ← 按约定自动 import
@@ -225,16 +255,17 @@ webx/
 ├── paths.py       项目根定位，零依赖
 ├── config.py      BaseSettings，只依赖 paths + environs
 ├── i18n.py        文案注册表，零依赖（全框架共用，故必须是叶子）
-├── lib/           令牌、密码哈希、表结构同步、权限注册表、发送通道、短信、存储（零 ORM）
-├── models/        user / admin / verify_code / rbac / dtos
-├── services/      user / admin / verifycode / permission / init_permission / storage
+├── lib/           令牌、密码哈希、表结构同步、权限注册表、发送通道、短信、存储、任务类型注册表 / 配额 / 点数接缝（零 ORM）
+├── models/        user / admin / verify_code / rbac / task / dtos
+├── services/      user / admin / verifycode / permission / init_permission / storage / task / lease / claim / reconciler
 ├── middleware/    可插拔中间件，一件一文件（认证 / RBAC / CORS / 通用件）
 ├── core/          应用工厂、蓝图扫描、ORM 初始化、异常、日志、路由级守卫
 ├── controller/    内置路由，与业务项目同一套 __mid__.py 机制
 │   ├── auth/      公开
 │   ├── api/       需登录
 │   ├── admin/     需管理员 + 权限加载
-│   └── public/    签名下载
+│   ├── public/    签名下载
+│   └── internal/  服务间回调（内部令牌）
 ```
 
 `config` / `paths` / `i18n` **不在 core 里**：它们是被所有层使用的叶子模块，放进 core 会让
@@ -248,7 +279,8 @@ webx/
 这条分层约束由 `tests/test_layering.py` 用 AST 扫描全部 import 焊死，
 一次随手的反向 import 就会让测试失败。
 
-开箱即有 39 条路由，其中 33 条是 `webx/controller/` 内置的，业务侧一行挂载代码都不用写。
+开箱即有 86 条路由，其中 80 条是 `webx/controller/` 内置的（含任务接口），业务侧一行挂载代码都不用写。
+路径设计遵循 `docs/api-conventions.md`；其中改过名的旧路径仍可用，响应带 `Deprecation` 头。
 `app/` 里自带的 `Note` 模型与 `/public/welcome`、`/api/notes` 只是示例，
 用来演示中间件链与目录约定——起项目时删掉即可（`Note` 表跟着 `app/models` 自动建出来）。
 
@@ -506,12 +538,13 @@ register_permissions({
 
 - **`openapi_enricher.py`**（原项目 816 行）：直接 import 业务 DTO 与具体控制器常量，
   是业务件而非框架件，**有意未搬**，不是遗漏。
-- worker / 补偿器 / ZMQ broker / 存储服务：按设计目标排除，webx 只面向纯 web 服务。
-- 原 `tools/` 里的 `keygen.py`、`fetch_cert.py`（ZMQ CURVE 证书）、
-  `reconciler_server.py`、`cleanup_chain.py`（业务任务链）、`codeprompt.py`（开发辅助）：
-  非 web 框架件。与 web 相关的 `admin_cmd` / `setauth_cmd` / `init_permission_cmd` /
-  `dbsync` 已整合进 `tools/`。
-- 业务模型（Task / Notice 等）与业务 services：留在原项目。
+- **ZMQ**：分发早已改为 worker 经 HTTP 长连接主动领取，ZMQ broker 与 CURVE 证书工具（`keygen.py` / `fetch_cert.py`）已过时，不迁。
+- **业务任务类型与业务服务**（具体的计算任务、任务链清理 `cleanup_chain.py`、业务通知等）：留在原项目；
+  任务类型由使用方用 `register_task_type` 登记，补偿器的业务动作用 `register_sweep` / `register_failed_hook` 挂钩子。
+- **点数 / 计费**：只有接口和闸门（`PricingPolicy`、估算钩子、流水表模型），**没有余额、预扣、退款的实现**——待设计，不在这里臆造。
+- **存储保留期清理的自动启动**：原项目的存储启动脚本无条件拉起清理进程，与其“已停用”的文档矛盾，不照搬；
+  现在是可配置的独立进程，默认关闭（见 `docs/storage-service.md`）。
+- 开发辅助 `codeprompt.py`：非框架件。与 web 相关的 `admin_cmd` / `setauth_cmd` / `init_permission_cmd` / `dbsync` 已整合进 `tools/`。
 
 关于用户模型：webx 给的是**具体的 `User` / `Admin` 表**，不做「可替换用户模型」那套机制。
 实测 Tortoise 的 `Meta` 是普通类属性、子类会直接遮蔽父类，抽象基类上的

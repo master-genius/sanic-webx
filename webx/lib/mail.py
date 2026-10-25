@@ -32,8 +32,9 @@ def _send_mail_sync(to_addr: str, subject: str, body: str, content_type: str = "
     if not sender:
         raise ValueError("MAIL_DEFAULT_SENDER 或 MAIL_USERNAME 未配置")
 
-    # 发件人名称使用完整品牌名，避免被反垃圾系统拦截
-    from_name = "DeepMice 科学计算平台"
+    # 发件人名称用完整的应用显示名，避免被反垃圾系统拦截。不是写死的品牌名——这是通用框架，
+    # 品牌由使用方通过 APP_DISPLAY_NAME 配置（未配则回落 APP_NAME，与验证码邮件正文用的是同一个名字）
+    from_name = settings.APP_DISPLAY_NAME or settings.APP_NAME
     msg = MIMEText(body, content_type, "utf-8")
     msg["Subject"] = subject
     msg["From"] = formataddr((from_name, sender))
