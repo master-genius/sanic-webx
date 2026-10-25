@@ -104,8 +104,22 @@ async def test_replay_uses_the_token_snapshotted_in_the_entry(server, rep):
     assert fencing.lease_seq_of(tid) is None
     assert await rep._try_report(_entry(tid, "complete_task")) == "success"
     call = server.calls_to("POST", r"/complete$")[-1]
-    assert "x-worker-id" not in call["headers"], "重放不该依赖请求头钩子"
+    # 令牌显式放进 header（服务端以 header 为准）并与 body 同源——都来自条目快照，不来自请求钩子
+    assert call["headers"]["x-worker-id"] == "test-host-e2e" and call["headers"]["x-lease-seq"] == "3"
     assert call["json"] == {"worker_id": "test-host-e2e", "lease_seq": 3}
+
+
+async def test_replay_is_not_hijacked_by_a_newer_live_token_for_the_same_task(server, rep):
+    """★ 同一台 worker 重新领到该任务（注册表里是新一轮的 lease_seq=6）后，上一轮留在重试池里的旧条目（seq=3）
+    重放：请求钩子若覆盖显式头，旧条目就会带着新一轮的令牌通过校验——旧的 fail 把健康的新一轮标成失败。"""
+    tid = _running_task(server)                      # 服务端当前租户是 (test-host-e2e, 3)
+    fencing.register(tid, 6)
+    try:
+        assert await rep._try_report(_entry(tid, "complete_task")) == "success"
+        call = server.calls_to("POST", r"/complete$")[-1]
+        assert call["headers"]["x-lease-seq"] == "3", "必须发条目里的令牌，而不是注册表里的 6"
+    finally:
+        fencing.unregister(tid)
 
 
 async def test_entry_without_token_is_a_permanent_rejection(server, rep):

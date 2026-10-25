@@ -144,7 +144,17 @@ class LeaseClient:
             return None
 
         if resp.status_code == 200:
-            return resp.json().get("tasks") or []
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+            tasks = data.get("tasks") or [] if isinstance(data, dict) else None
+            if not isinstance(tasks, list):
+                # 200 却不是 {"tasks": [...]}：多半是反代 / 网关返回了网页。当作一次失败退避重连，
+                # 不能让异常一路抛穿 gather 把整个 worker 进程带走（在跑的任务一起被打断）
+                logger.warning("[lease] 200 但响应体不是预期的 JSON 对象（反代返回了网页？）将退避重连 ← %s", url)
+                return None
+            return tasks
         if resp.status_code in _NO_RETRY_CODES:
             logger.error(
                 "[lease] 鉴权被拒 %s —— 需运维介入（token 配置）← %s",
@@ -282,6 +292,10 @@ class LeaseDispatcher:
                 await _cb.release_lease(task_id)
             except Exception:  # noqa: BLE001 —— 归还失败只是慢一点，由租约到期兜底
                 pass
+            # 必须冷却，理由同上面 ack 失败那处：归还不增加 requeues、也不改排序键，同一台 worker 会立刻又领到同一个
+            # 任务（磁盘满 / 只读文件系统这类结构性故障下，2 秒内领取 16 次、lease_seq 涨到 31）。
+            # 放在 finally 之前：冷却期间本 Lane 保持 busy，主循环不会绕过它
+            await asyncio.sleep(_ACK_FAIL_COOLDOWN_SEC)
         finally:
             from .fencing import unregister as fence_unregister
 

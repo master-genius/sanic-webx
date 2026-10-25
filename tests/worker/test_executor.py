@@ -51,6 +51,9 @@ class _StubCallback:
     storage_url = "http://localhost"
     storage_internal_url = "http://localhost"
 
+    def pop_ack_lease_remaining_ms(self, tid):
+        return None
+
 
 def _make(tmp_path, writer=None, **kw):
     return GenericTaskExecutor(
@@ -236,6 +239,9 @@ async def test_heartbeat_registers_before_download_and_log_uploads_before_comple
     class _HB:
         async def register(self, tid, on_beat=None):
             rec.events.append("hb_register")
+
+        def seed_lease(self, tid, remaining_ms):
+            pass
 
         async def unregister(self, tid):
             pass

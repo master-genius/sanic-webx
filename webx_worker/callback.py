@@ -26,6 +26,7 @@ ServerResult 区分三类服务端响应：
 
 import asyncio
 import logging
+import time
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -94,7 +95,10 @@ async def _inject_fencing_headers(request: "httpx.Request") -> None:
     from .fencing import headers_for
 
     for k, v in headers_for(m.group(1)).items():
-        request.headers[k] = v
+        # 不覆盖调用方显式带的头：重放旧条目时令牌来自条目快照（上一轮的 lease_seq），钩子读的却是当前活注册表——
+        # 覆盖的话，同一台 worker 重新领到该任务后，旧的 fail 会带着新一轮的令牌通过校验，把健康的新一轮标成失败
+        if k not in request.headers:
+            request.headers[k] = v
 
 
 def _enqueue_reason(resp: Optional["httpx.Response"], last_exc: Optional[BaseException]) -> str:
@@ -154,6 +158,8 @@ class WebCallbackClient:
         # 那条本该进重试队列的合法上报会被静默吞掉，任务白跑一轮等租约回收。
         # 带上代次之后，上一轮的闩锁与这一轮的键物理上不可能相等。
         self._fence_rejected: dict[tuple[str, int | None], str] = {}
+        # task_id → (ack 响应里的 lease_remaining_ms, 收到时的 monotonic)。供心跳注册时预置自熔基准
+        self._ack_info: dict[str, tuple[int, float]] = {}
 
     # ──────────────────────────────────────────────────────────────
     # 以下几项一律【访问期】现读 worker_settings，不在 __init__ 里拷贝快照。
@@ -248,8 +254,9 @@ class WebCallbackClient:
                     self._note_fence_reject(url, resp)
                     return resp, None
                 last_exc = httpx.HTTPError(f"HTTP {resp.status_code}")
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError,
-                    httpx.NetworkError, httpx.WriteError, OSError) as e:
+            # TransportError 是传输层异常的基类：ConnectTimeout / WriteTimeout / PoolTimeout 都不是 OSError 的子类，
+            # 列举具体类会漏掉它们（防火墙丢 SYN 时已跑完的任务因此被判失败重跑）
+            except (httpx.TransportError, OSError) as e:
                 last_exc = e
             if attempt < _CALLBACK_MAX_ATTEMPTS - 1:
                 await asyncio.sleep(_CALLBACK_BACKOFF_BASE_SEC * (2 ** attempt))
@@ -404,6 +411,12 @@ class WebCallbackClient:
         url = f"{self.base_url}/internal/tasks/{task_id}/ack"
         resp, last_exc = await self._send_with_retry("POST", url, {})
         if resp is not None and resp.status_code == 200:
+            try:
+                remaining = resp.json().get("lease_remaining_ms")
+                if isinstance(remaining, (int, float)):
+                    self._ack_info[task_id] = (int(remaining), time.monotonic())
+            except ValueError:
+                pass
             return True
         # ⚠️ 本方法是**唯一**「会置 fencing 闩锁却不入队」的出口：403 时
         # `_send_with_retry` 已经把闩锁记下了，而下面直接 return，没有 `_enqueue_pending`
@@ -419,6 +432,18 @@ class WebCallbackClient:
             f"原因={_enqueue_reason(resp, last_exc)}（任务将在短租约到期后回池）"
         )
         return False
+
+    def pop_ack_lease_remaining_ms(self, task_id: str) -> int | None:
+        """取走 ack 时服务端告知的剩余租约（已扣除自收到起流逝的时间）；没有则 None。
+
+        用来给心跳预置自熔基准：否则“ack 成功之后一次心跳也没成功过”（服务端立刻不可达）时根本没有 deadline，
+        自熔永远不启动，worker 无限期继续算、服务端早已把任务租给了别人。
+        """
+        info = self._ack_info.pop(task_id, None)
+        if info is None:
+            return None
+        remaining_ms, at = info
+        return int(remaining_ms - (time.monotonic() - at) * 1000)
 
     async def release_lease(self, task_id: str, extra_headers: dict | None = None) -> bool:
         """主动归还租约 → DELETE /internal/tasks/{id}/lease，任务立刻回池，不必等租约自然到期。

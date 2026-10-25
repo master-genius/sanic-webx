@@ -28,6 +28,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: 单行 JSON 事件的长度上限（字节）
+_IPC_LINE_LIMIT = 16 * 1024 * 1024
+
 
 class IPCServer:
     """AF_UNIX server，接 worker 内部的 PendingReporter"""
@@ -46,8 +49,10 @@ class IPCServer:
         except FileNotFoundError:
             pass
 
+        # limit：StreamReader.readline 默认 64KiB 上限，超限抛 ValueError，连接被关，而客户端 sendall 已成功、
+        # 以为投递了——这条事件和同连接上之后的事件就静默丢了。步骤列表 / 产物地址很容易超过 64KiB
         self._server = await asyncio.start_unix_server(
-            self._handle_client, path=str(self.sock_path),
+            self._handle_client, path=str(self.sock_path), limit=_IPC_LINE_LIMIT,
         )
         try:
             os.chmod(self.sock_path, 0o600)

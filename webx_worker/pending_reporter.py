@@ -163,10 +163,22 @@ class PendingReporter:
         pool = self._retry_pool
         self._retry_pool = []
         logger.debug(f"[Reporter] 轮询 retry_pool: {len(pool)} 条")
-        for entry in pool:
-            outcome = await self._try_report(entry)
-            if outcome == "retry":
-                self._retry_pool.append(entry)
+        remaining: list = []
+        done = 0
+        try:
+            for entry in pool:
+                outcome = await self._try_report(entry)
+                done += 1
+                if outcome == "retry":
+                    remaining.append(entry)
+        except BaseException:
+            # 停机时 consumer 被取消，sweep 多半正悬在某个 await 上。池子已经换成空列表，没处理完的条目只存在于
+            # 局部变量里——不放回去，停机快照就是空的，经 IPC 转交的 steps / fields 没有任何别的兜底。
+            # 含正在发送的那一条：重放是幂等的，宁可多送一次也不丢
+            remaining.extend(pool[done:])
+            raise
+        finally:
+            self._retry_pool = remaining + self._retry_pool
 
     # ─── 单次重试（核心） ─────────────────────────────────────────
 
@@ -253,29 +265,35 @@ class PendingReporter:
         """
         client = await self.callback._get_client()
         base = self.callback.base_url
+        payload = dict(payload)          # 下面会 pop("_mode")：不能就地改条目，否则第二次重放丢失 merge 模式
+        headers: dict[str, str] = {}
         if fencing:
             payload = {**payload, **fencing}
+            # 令牌同时放进 header，且 callback 的请求钩子不会覆盖已有的头：服务端以 header 为准，
+            # 钩子若换成当前活注册表里的令牌，旧条目就会带着新一轮的令牌通过校验
+            if fencing.get("worker_id") and fencing.get("lease_seq") is not None:
+                headers = {"X-Worker-Id": str(fencing["worker_id"]), "X-Lease-Seq": str(fencing["lease_seq"])}
 
         # action → (方法, 路径)：与 docs/worker-protocol.md §4 一致
         # （PUT /status、PATCH /steps、PATCH /fields，其余 POST）
         if action == ACTION_UPDATE_STEP_STATUS:
             url = f"{base}/internal/tasks/{task_id}/steps"
-            resp = await client.patch(url, json=payload)
+            resp = await client.patch(url, json=payload, headers=headers)
         elif action == ACTION_UPDATE_TASK_FIELDS:
             mode = payload.pop("_mode", "overwrite") if "_mode" in payload else "overwrite"
             url = f"{base}/internal/tasks/{task_id}/fields"
             if mode == "merge":
                 url += "?mode=merge"
-            resp = await client.patch(url, json=payload)
+            resp = await client.patch(url, json=payload, headers=headers)
         elif action == ACTION_UPDATE_STATUS:
             url = f"{base}/internal/tasks/{task_id}/status"
-            resp = await client.put(url, json=payload)
+            resp = await client.put(url, json=payload, headers=headers)
         elif action == ACTION_COMPLETE_TASK:
             url = f"{base}/internal/tasks/{task_id}/complete"
-            resp = await client.post(url, json=payload or {})
+            resp = await client.post(url, json=payload or {}, headers=headers)
         elif action == ACTION_FAIL_TASK:
             url = f"{base}/internal/tasks/{task_id}/fail"
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
         else:
             logger.error(f"[Reporter] 未知 action: {action}, 丢弃")
             return 400, None  # 当作业务拒绝丢弃

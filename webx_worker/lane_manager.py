@@ -52,9 +52,17 @@ class LaneManager:
         self.num_lanes = max(len(lanes), 1)
         self.task_to_lane: dict[str, int] = {}
 
+        undeclared: list[str] = []
         for i, lane_tasks in enumerate(lanes):
             for task_type in lane_tasks:
+                if declared and task_type not in declared:
+                    # LANES 里写了、CHANNELS 里没有的类型（多半是拼写错误）：若照常进入能力声明，worker 会领走
+                    # 这类任务，再因“未配置执行环境”把用户任务判成永久失败，本可由有能力的 worker 来跑
+                    undeclared.append(task_type)
+                    continue
                 self.task_to_lane[task_type] = i
+        if undeclared:
+            logger.error("LANES 中的 %s 不在 CHANNELS 里（拼写错误？），已从能力声明中排除，不会领取这些任务", undeclared)
 
         # 一致性告警（只说不改）：已声明却没进任何 Lane 的 channel 永远领不到任务，
         # 属于配置遗漏，悄悄吞掉比报错更难排查。

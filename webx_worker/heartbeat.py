@@ -60,6 +60,11 @@ class HeartbeatManager:
         self._beat_inflight: dict[str, asyncio.Task] = {}
         self._beat_pending: set[str] = set()
 
+    def seed_lease(self, task_id: str, remaining_ms: int | None) -> None:
+        """用已知的剩余租约（ack 响应）预置自熔基准，使“从未成功续租过”的任务也有 deadline。"""
+        if remaining_ms is not None and remaining_ms > 0:
+            self._note_renewed(task_id, {"lease_until": 1, "lease_remaining_ms": remaining_ms})
+
     async def register(
         self,
         task_id: str,

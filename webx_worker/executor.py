@@ -155,6 +155,7 @@ class GenericTaskExecutor:
                 task_id,
                 on_beat=partial(self._stream_log, log_key=log_key, log_filename=log_upload_name),
             )
+            self.heartbeat.seed_lease(task_id, self.callback.pop_ack_lease_remaining_ms(task_id))
 
             # 2. 下载输入文件
             await self._download_inputs(task_id, payload, in_dir, task_type)
@@ -257,7 +258,15 @@ class GenericTaskExecutor:
                                 result_path=local_result_path, log_path=local_log_path or "")
 
             # 9. 回调：仅触发状态迁移，不传业务数据
-            success = await self.callback.complete_task(task_id)
+            try:
+                success = await self.callback.complete_task(task_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # 产物与 ok.json(completed) 都已就绪，只是通知没送达：绝不能落进下面的“任务失败”分支
+                # （那会把已完成的计算作废、覆盖成 failed 并归还租约，整个任务重跑）。保持未确认，交给 recovery / 补偿器
+                logger.error(f"[{task_type}] 完成回调异常，保持 completed 未确认 task_id={task_id}: {e}")
+                success = False
 
             if success:
                 self._write_ok_json(task_dir, task_id, "completed", server_confirmed=True,
@@ -612,24 +621,39 @@ class GenericTaskExecutor:
 
         drain_task = asyncio.create_task(_drain_stdout())
         cancel_waiter = asyncio.create_task(cancel_event.wait()) if cancel_event else None
+        async def _wait_exit() -> None:
+            # 不能用 proc.wait()：asyncio 的 Process.wait() 要等 stdout 管道也关闭才返回——后台子孙继承了管道时
+            # 它同样永远不返回。returncode 在进程一退出就由 asyncio 置位，轮询它才是真正的“组长已退出”
+            while proc.returncode is None:
+                await asyncio.sleep(0.1)
+
+        proc_waiter = asyncio.create_task(_wait_exit())
+
+        def _kill_group() -> None:
+            # start_new_session=True ⇒ 子进程是新会话组长，pgid == pid，直接用 proc.pid。
+            # 不要再 getpgid(proc.pid)：组长一旦被 asyncio 回收，getpgid 就抛 ProcessLookupError，
+            # 而组里遗留的子孙进程这时恰恰还活着——取消 / 超时 / 自熔都杀不掉它们
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
         try:
-            # 三路竞态：cancel_waiter 完成 = 收到取消信号；drain 完成 = stdout EOF =
-            # 子进程退出；二者皆未完成且 timeout 到 = 计算超时。均不依赖子进程是否在输出。
-            waiters = {drain_task} | ({cancel_waiter} if cancel_waiter else set())
+            # 三路竞态：cancel_waiter 完成 = 收到取消信号；proc_waiter 完成 = 子进程（组长）退出；
+            # 二者皆未完成且 timeout 到 = 计算超时。均不依赖子进程是否在输出。
+            # ⚠️ 以进程退出而不是 stdout EOF 作为“结束”的信号：脚本主进程退出后，只要有后台子孙继承了
+            # stdout 管道，EOF 就永远不来——Lane 会被占到 timeout_seconds（默认 48 小时），心跳还在续租。
+            waiters = {proc_waiter} | ({cancel_waiter} if cancel_waiter else set())
             done, _ = await asyncio.wait(
                 waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
             )
 
             cancelled = cancel_waiter is not None and cancel_waiter in done
-            timed_out = not cancelled and drain_task not in done
+            timed_out = not cancelled and proc_waiter not in done
 
             if cancelled or timed_out:
                 # 主动终止子进程组（Linux 信号；子进程是新会话的独立进程组的组长）
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _kill_group()
                 # 让 drain 读完残余输出 + flush 末段日志（子进程已杀，EOF 将至；兜底防卡）
                 if not drain_task.done():
                     try:
@@ -645,8 +669,19 @@ class GenericTaskExecutor:
                 logger.error(f"子进程超时 task_id={task_id}")
                 raise RuntimeError(f"计算超时（>{timeout}s）")
 
-            # drain 已 EOF = 子进程退出，等它回收并取退出码
-            await proc.wait()
+            # 组长已退出：给 drain 一个短宽限读完残余输出，然后无条件清理组里遗留的子孙进程
+            # （正常退出也可能留下后台进程；它们不该活过这个任务）
+            if not drain_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(drain_task), timeout=_DRAIN_GRACE_SEC)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            _kill_group()
+            if not drain_task.done():
+                try:
+                    await asyncio.wait_for(drain_task, timeout=_DRAIN_GRACE_SEC)   # 子孙已杀，EOF 将至
+                except (asyncio.TimeoutError, Exception):
+                    pass
         finally:
             # ⚠️ 先**同步**发 SIGKILL（不 await），再做任何可能被打断的清理/回收。
             #
@@ -657,17 +692,16 @@ class GenericTaskExecutor:
             # 信号同步送达，之后 await 被打断最多留个僵尸，不会泄漏算力。
             # 用 killpg（进程组）而非 proc.kill()（仅组长），与主分支一致，避免子孙进程逃逸。
             if proc.returncode is None:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                _kill_group()
             # 取消并 await 残留竞态任务（吞 CancelledError，避免遗留 pending task）；再回收进程
             if cancel_waiter is not None and not cancel_waiter.done():
                 cancel_waiter.cancel()
             if not drain_task.done():
                 drain_task.cancel()
+            if not proc_waiter.done():
+                proc_waiter.cancel()
             await asyncio.gather(
-                *[t for t in (drain_task, cancel_waiter) if t is not None],
+                *[t for t in (drain_task, cancel_waiter, proc_waiter) if t is not None],
                 return_exceptions=True,
             )
             if proc.returncode is None:
@@ -677,7 +711,9 @@ class GenericTaskExecutor:
             log_content = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
             logger.error(f"子进程退出码 {proc.returncode}，最后输出:\n{log_content[-500:]}")
 
-        return proc.returncode
+        # -1 在本函数里专指“被取消”（上面的 return -1）。子进程自己被 SIGHUP 杀死时 returncode 也是 -1，
+        # 若原样返回会被当成用户取消：不上报失败、ok.json 写 cancelled，任务一直 running 到租约到期。映射成 128+1
+        return 129 if proc.returncode == -1 else proc.returncode
 
     async def _upload_step_log(self, task_id: str, log_key: str, log_filename: str) -> None:
         """上传步骤日志到存储服务并更新 log_path（JSON 格式，按步骤索引）。
