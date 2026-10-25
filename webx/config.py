@@ -60,6 +60,11 @@ def _sms_templates_from_env() -> dict[str, str]:
     return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
 
 
+#: TOKEN_SECRET 的公开默认值。它写在源码和 .env.example 里，等于人人皆知——
+#: 任何“靠它保密”的用途（签名、令牌）遇到它都必须拒绝，而不是照常工作。
+DEFAULT_TOKEN_SECRET = "change-me-in-production"
+
+
 @dataclass
 class BaseSettings:
     """通用配置骨架。业务项目继承后追加自有字段。"""
@@ -108,7 +113,7 @@ class BaseSettings:
 
     # ==================== 令牌 / 鉴权 ====================
     # WebxToken（AES-256-GCM）主密钥。长度 < 16 会被 fix_key 拒绝，务必配置真值。
-    TOKEN_SECRET: str = field(default_factory=lambda: env.str("TOKEN_SECRET", "change-me-in-production"))
+    TOKEN_SECRET: str = field(default_factory=lambda: env.str("TOKEN_SECRET", DEFAULT_TOKEN_SECRET))
     TOKEN_EXPIRE_MINUTES: int = field(default_factory=lambda: env.int("TOKEN_EXPIRE_MINUTES", 1440))
     # 签发/校验时可用的 token id 集合（多端隔离：user / admin / ...）
     TOKEN_IDS: list[str] = field(default_factory=lambda: env.list("TOKEN_IDS", default=["user", "admin"]))

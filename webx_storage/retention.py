@@ -196,6 +196,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     store = ObjectStore(settings.storage_path, settings.STORAGE_KEY_RULE)
 
+    # 保留天数必须 > 0，且对所有模式生效：<=0 意味着“所有对象都已过期”，`--once` 会删光刚上传的文件
+    if settings.STORAGE_RETENTION_DAYS <= 0:
+        print("STORAGE_RETENTION_DAYS <= 0：拒绝执行清理（<=0 会把所有对象判为过期）")
+        return 2 if (args.once or args.dry_run) else 0
+
     if args.once or args.dry_run:
         for policy in policies:
             checked, removed = sweep(
@@ -206,9 +211,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if not settings.STORAGE_RETENTION_ENABLED:
         print("STORAGE_RETENTION_ENABLED 未开启，清理器不启动（删除不可逆，必须显式开启）")
-        return 0
-    if settings.STORAGE_RETENTION_DAYS <= 0:
-        print("STORAGE_RETENTION_DAYS <= 0，清理器不启动")
         return 0
     try:
         asyncio.run(

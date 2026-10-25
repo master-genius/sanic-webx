@@ -29,6 +29,19 @@ def decode_param(value: str) -> str:
     return unquote(value)
 
 
+def json_object(request: Request) -> dict:
+    """请求体 JSON 对象；缺省（无体 / null）当空对象，**其它形状（数组、字符串、数字）一律 400**。
+
+    各处理器原先写 ``request.json or {}`` 再 ``.get``：体是 ``[1]`` / ``"x"`` / ``123`` 时 AttributeError → 500。
+    """
+    body = request.json
+    if body is None or body == {}:
+        return {}
+    if not isinstance(body, dict):
+        raise StoreError("请求体必须是 JSON 对象", status=400)
+    return body
+
+
 def store_error_response(exc: StoreError):
     """把存储层异常翻成 HTTP 响应（异常自带建议状态码）。
 

@@ -59,11 +59,13 @@ class KeyRule:
         return f"KeyRule({self.name})"
 
 
+# ⚠️ 用 \A…\Z 而不是 ^…$：Python 的 $ 会匹配“字符串末尾换行之前”，"a\n" 会被放行，
+# 造出带换行的不可见同名文件并污染日志。
 #: 严格：字母数字 + ``_`` ``-`` ``.``（默认，适合机器生成的键）
-STRICT = KeyRule("strict", re.compile(r"^[A-Za-z0-9_.-]+$"))
+STRICT = KeyRule("strict", re.compile(r"\A[A-Za-z0-9_.-]+\Z"))
 #: 宽松：任意可打印字符（含中文、空格、括号），仍排除路径分隔符与控制字符。
 #: 适合需要保留用户原始文件名的场景
-LENIENT = KeyRule("lenient", re.compile(r"^[^\x00-\x1f\x7f/\\]+$"))
+LENIENT = KeyRule("lenient", re.compile(r"\A[^\x00-\x1f\x7f/\\]+\Z"))
 
 KEY_RULES = {"strict": STRICT, "lenient": LENIENT}
 
@@ -282,9 +284,31 @@ class ObjectWriter:
         self._fh.close()
         self._closed = True
 
-        os.replace(self._tmp, final_path)  # 同目录 rename，原子
+        self._place(final_path)
         logger.info("对象已保存(流式): %s (%d bytes)", final_path, self.size)
         return final_path
+
+    def _place(self, final_path: Path) -> None:
+        """tmp → 最终路径的原子落位，并把文件系统层面的失败翻成 ``StoreError``。
+
+        - 键与现有路径冲突（父段是文件 / 目标是目录）是**客户端的键选错了**：409，不是 500。
+        - 目标目录刚被并发的 DELETE 修剪掉（``_prune_empty_parents`` 会 rmdir 空目录）：重建后重试一次。
+          窗口是 mkdir 到 replace 之间（含大文件的 fsync 时间），不重试上传就白传了。
+        失败时 tmp 仍在，由调用方 ``abort()`` 清理（所有调用点都这样做）。
+        """
+        for attempt in (1, 2):
+            try:
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(self._tmp, final_path)
+                return
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise StoreError("目标目录被并发删除，请重试", status=409) from None
+            except (FileExistsError, IsADirectoryError, NotADirectoryError):
+                raise StoreError("对象键与已有路径冲突（父段是文件，或目标是目录）", status=409) from None
+            except OSError as e:
+                logger.error("对象落位失败: %s -> %s: %s", self._tmp, final_path, e)
+                raise StoreError("存储写入失败", status=500) from None
 
     def finalize_to(self, key: str) -> Path:
         """原子落位到**任意**对象键（目标目录不必是写入器创建时的前缀目录）。
@@ -294,14 +318,13 @@ class ObjectWriter:
         ``os.replace`` 仍然原子。键非法抛 ``StoreError``，调用方负责 ``abort()``。
         """
         final_path = self._store.path_for(key)
-        final_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._fh.flush()
         os.fsync(self._fh.fileno())
         self._fh.close()
         self._closed = True
 
-        os.replace(self._tmp, final_path)
+        self._place(final_path)
         logger.info("对象已保存(流式): %s (%d bytes)", final_path, self.size)
         return final_path
 

@@ -28,6 +28,7 @@ from webx.lib.storage import StoreError
 from webx.services.storage_http import (
     append_chunk,
     decode_param,
+    json_object,
     receive_multipart,
     store_error_response,
     with_offset,
@@ -44,7 +45,12 @@ def deprecated(successor: str):
         async def wrapper(*args, **kwargs):
             resp = await f(*args, **kwargs)
             resp.headers["Deprecation"] = "true"
-            resp.headers["Link"] = f'<{successor}>; rel="successor-version"'
+            # successor 里的 {task_id} 这类占位符用本次请求的路径参数展开；不在路径里的（如 /sign 的 task_id
+            # 在请求体里）保持原样，宁可留着模板也不编一个值
+            target = successor
+            for name, value in kwargs.items():
+                target = target.replace("{" + name + "}", str(value))
+            resp.headers["Link"] = f'<{target}>; rel="successor-version"'
             return resp
 
         return wrapper
@@ -59,7 +65,7 @@ def parse_total(body: dict) -> int:
     """
     try:
         return int(body.get("total", -1))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: {"total": 1e400} / Infinity
         return -1
 
 
@@ -67,7 +73,7 @@ def parse_ttl(body: dict):
     ttl = body.get("ttl_seconds")
     try:
         return int(ttl) if ttl is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -145,7 +151,7 @@ def mount_core(ctx: StorageContext) -> None:
     @internal.post("/uploads")
     @require_internal_token
     async def create_upload(request: Request):
-        body = request.json or {}
+        body = json_object(request)
         key = str(body.get("key") or "").strip()
         if not key:
             return json({"error": "缺少 key"}, status=400)
@@ -196,7 +202,7 @@ def mount_core(ctx: StorageContext) -> None:
     @require_internal_token
     async def create_signature(request: Request):
         """签发限时下载签名。可在对象上传前预签——校验只比对对象键与有效期。"""
-        body = request.json or {}
+        body = json_object(request)
         try:
             key = svc.store.normalize(str(body.get("key") or ""))
         except StoreError as e:

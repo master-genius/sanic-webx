@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import logging
@@ -132,14 +133,30 @@ class ChunkedUpload:
         if not part_file.exists() or not (part_file.parent / "meta.json").exists():
             raise StoreError("分片会话不存在或已过期", status=404)
 
-        with open(part_file, "ab") as f:
+        try:
+            f = open(part_file, "ab")
+        except FileNotFoundError:
+            raise StoreError("分片会话不存在或已过期", status=404) from None
+        with f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
+                # 拿到锁后复核：打开文件到拿到锁之间，会话可能已被 complete()（part 被 rename 成正式对象）
+                # 或被清理。此时手里的 fd 指向的已不是会话的 part——继续写会把数据追加进已发布的对象
+                try:
+                    if os.fstat(f.fileno()).st_ino != os.stat(part_file).st_ino:
+                        raise FileNotFoundError
+                except FileNotFoundError:
+                    raise StoreError("分片会话不存在或已过期", status=404) from None
                 current = os.fstat(f.fileno()).st_size
                 if offset != current:
                     raise OffsetConflict(current)
-                f.write(data)
-                f.flush()
+                try:
+                    f.write(data)
+                    f.flush()
+                except OSError as e:
+                    if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                        raise StoreError("存储空间不足", status=507) from e
+                    raise
                 return f.tell()
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
@@ -153,16 +170,30 @@ class ChunkedUpload:
         session = self.get(upload_id)
         if session is None:
             raise StoreError("分片会话不存在或已过期", status=404)
-
-        offset, total = session["offset"], session["total"]
-        if total >= 0 and offset != total:
-            raise StoreError(
-                f"字节数不完整：已收 {offset}，声明 total={total}", status=400
-            )
-
+        total = session["total"]
         final_path = self.store.path_for(session["key"])
-        final_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(self._session_dir(upload_id) / "part", final_path)  # 原子落位
+        part_file = self._session_dir(upload_id) / "part"
+
+        # 与 append() 取同一把排他锁，并在锁内重新量大小：否则正在途中的 PATCH 会在落位之后
+        # 把数据追加进已经发布的对象（complete 回报 5 字节，文件实际 25 字节）
+        try:
+            lock_fh = open(part_file, "rb")
+        except FileNotFoundError:
+            raise StoreError("分片会话不存在或已过期", status=404) from None
+        with lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            offset = os.fstat(lock_fh.fileno()).st_size
+            if total >= 0 and offset != total:
+                raise StoreError(
+                    f"字节数不完整：已收 {offset}，声明 total={total}", status=400
+                )
+            try:
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(part_file, final_path)  # 原子落位
+            except (FileExistsError, IsADirectoryError, NotADirectoryError):
+                raise StoreError("对象键与已有路径冲突（父段是文件，或目标是目录）", status=409) from None
+            except FileNotFoundError:
+                raise StoreError("分片会话不存在或已过期", status=404) from None
         self.abort(upload_id)  # 清理会话目录（part 已 move，仅剩 meta.json）
 
         logger.info("分片上传完成: upload_id=%s -> %s (%d bytes)", upload_id, final_path, offset)
@@ -198,7 +229,7 @@ class ChunkedUpload:
             if not sdir.is_dir():
                 continue
             try:
-                if now_ms - self._created_ms(sdir) < cutoff_ms:
+                if now_ms - self._last_active_ms(sdir) < cutoff_ms:
                     continue
                 shutil.rmtree(sdir)
                 removed += 1
@@ -208,6 +239,18 @@ class ChunkedUpload:
         if removed:
             logger.info("清理超龄分片会话 %d 个（>%sh）", removed, max_age_hours)
         return removed
+
+    def _last_active_ms(self, sdir: Path) -> int:
+        """会话最近一次活动的时刻：创建时间与 part 文件最后写入时间取较晚者。
+
+        只看创建时间会把“仍在慢速上传的大文件”当成陈旧会话：每个 worker 启动时都会跑一次回收，
+        重启或扩容一台就把别人正在传的会话整个删掉，客户端续传得到 404。
+        """
+        created = self._created_ms(sdir)
+        try:
+            return max(created, int((sdir / "part").stat().st_mtime * 1000))
+        except OSError:
+            return created
 
     @staticmethod
     def _created_ms(sdir: Path) -> int:

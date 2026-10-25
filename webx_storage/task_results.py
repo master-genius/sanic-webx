@@ -31,14 +31,14 @@ import logging
 import re
 from pathlib import PurePosixPath
 from typing import Optional
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from sanic.request import Request
 from sanic.response import json, text
 
 from webx.config import settings
 from webx.lib.storage import StoreError
-from webx.services.storage_http import decode_param, receive_multipart, store_error_response
+from webx.services.storage_http import decode_param, json_object, receive_multipart, store_error_response
 from webx_storage.auth import require_internal_token
 from webx_storage.policy import KeyPolicy, StorageContext, register_policy
 from webx_storage.retention import MtimeRetention, RetentionPolicy
@@ -47,7 +47,7 @@ from webx_storage.routes import parse_total, parse_ttl
 
 logger = logging.getLogger(__name__)
 
-_TASK_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_TASK_ID = re.compile(r"\A[A-Za-z0-9_-]+\Z")  # \Z 而非 $：后者放行末尾换行
 
 # 非法文件名字符（< > : " / \ | ? * 及控制字符）→ '-'，用于下载名前缀
 _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -71,7 +71,7 @@ class TaskResultsPolicy(KeyPolicy):
 
     @staticmethod
     def check_task_id(task_id: str) -> str:
-        if not task_id or not _TASK_ID.match(task_id):
+        if not isinstance(task_id, str) or not task_id or not _TASK_ID.match(task_id):
             raise StoreError(f"非法 task_id: {task_id!r}", status=400)
         return task_id
 
@@ -83,7 +83,7 @@ class TaskResultsPolicy(KeyPolicy):
         ``b.txt``），两处语义不一致，且调用方永远不知道自己的名字被改了——比被拒绝更糟。
         字符集由存储的键规则再挡一道。
         """
-        name = filename or ""
+        name = filename if isinstance(filename, str) else ""
         if not name or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
             raise StoreError(f"非法 filename（不得为空，不得含路径分隔符）: {filename!r}", status=400)
         return name
@@ -93,7 +93,9 @@ class TaskResultsPolicy(KeyPolicy):
 
     @staticmethod
     def download_url(task_id: str, filename: str) -> str:
-        return f"/public/tasks/{task_id}/results/{filename}"
+        # 逐段百分号编码：服务端对路径参数只解码一次（decode_param），所以名字里的 # ? % 必须编码，
+        # 否则链接 404，更糟的是 "100%25.txt" 会被解成 "100%.txt" 而取到另一个文件
+        return f"/public/tasks/{quote(task_id, safe='')}/results/{quote(filename, safe='')}"
 
     def owns(self, key: str) -> bool:
         return key == "tasks" or key.startswith("tasks/")
@@ -122,7 +124,11 @@ class TaskResultsPolicy(KeyPolicy):
         """
         if not url or not isinstance(url, str):
             return None
-        segs = [s for s in unquote(urlsplit(url.strip()).path).split("/") if s]
+        try:
+            path = urlsplit(url.strip()).path
+        except ValueError:      # 如 "http://[bad"：批量删除要“永不整体失败”，坏条目只标记为不是结果地址
+            return None
+        segs = [unquote(s) for s in path.split("/") if s]
         if len(segs) < 4 or segs[-4] != "tasks" or segs[-2] != "results":
             return None
         return segs[-3], segs[-1]
@@ -175,7 +181,7 @@ class TaskResultsPolicy(KeyPolicy):
             )
 
         async def create_session(request: Request, task_id: str, status: int):
-            body = request.json or {}
+            body = json_object(request)
             if not body.get("filename"):
                 return json({"error": "缺少 filename"}, status=400)
             try:
@@ -280,7 +286,7 @@ class TaskResultsPolicy(KeyPolicy):
         @internal.post("/tasks/<task_id:str>/signatures")
         @require_internal_token
         async def create_task_signature(request: Request, task_id: str):
-            return await create_signature(request, task_id, request.json or {})
+            return await create_signature(request, task_id, json_object(request))
 
         @internal.delete("/tasks/<task_id:str>")
         @require_internal_token
@@ -331,8 +337,14 @@ class TaskResultsPolicy(KeyPolicy):
             if request.method == "HEAD":
                 return svc.head(path)
             if path.name.lower().endswith(policy.inline_suffixes):
-                content = path.read_text(encoding="utf-8", errors="replace")
-                return text(content, headers={"Content-Disposition": "inline", "Cache-Control": "no-cache"})
+                # 流式 + 支持 Range：日志可能很大，整读进内存会卡住事件循环（单 worker 下所有请求一起卡）
+                return await svc.send(
+                    path,
+                    inline=True,
+                    content_type="text/plain",
+                    range_header=request.headers.get("range"),
+                    extra_headers={"Cache-Control": "no-cache"},
+                )
             return await svc.send(
                 path,
                 download_name=policy.download_name(task_id, path.name, request.args.get("name")),
@@ -363,7 +375,7 @@ class TaskResultsPolicy(KeyPolicy):
         @require_internal_token
         @_deprecated("/internal/tasks/{task_id}/signatures")
         async def legacy_sign(request: Request):
-            body = request.json or {}
+            body = json_object(request)
             return await create_signature(request, str(body.get("task_id") or ""), body)
 
 

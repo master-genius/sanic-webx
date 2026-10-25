@@ -30,6 +30,8 @@ from sanic.response import json
 
 from webx.i18n import get_lang_from_header
 from webx.lib.errors import WebxError
+from webx.lib.storage import StoreError
+from webx.services.storage_http import store_error_response
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,13 @@ class TooManyRequestsError(WebxError):
 
 def setup_error_handlers(app) -> None:
     """注册统一异常处理器（由 create_app 自动调用）。"""
+
+    # 存储层异常自带建议状态码。各处理器通常自己接；这里是兜底，防止漏接的 StoreError 变成 500
+    @app.exception(StoreError)
+    async def _handle_store_error(request: Request, exc: StoreError):
+        if exc.status >= 500:
+            logger.error("存储层异常 %s: %s", exc.status, exc.message)
+        return store_error_response(exc)
 
     @app.exception(WebxError)
     async def _handle_webx_error(request: Request, exc: WebxError):

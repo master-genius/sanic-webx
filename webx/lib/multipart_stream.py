@@ -13,6 +13,8 @@ Sanic 的 ``request.stream.read`` 直接满足；存储服务和主站共用这�
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import logging
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
@@ -64,6 +66,7 @@ async def stream_multipart_into(
         "part_name": None, "part_filename": None, "is_file": False,
         "field_buf": bytearray(), "fields_bytes": 0,
         "result": MultipartResult(), "got_file": False, "error": None,
+        "ended": False,
     }
 
     def on_part_begin():
@@ -115,9 +118,13 @@ async def stream_multipart_into(
         if not st["is_file"] and st["part_name"]:
             st["result"].fields[st["part_name"]] = bytes(st["field_buf"]).decode("utf-8", "replace")
 
+    def on_end():
+        st["ended"] = True
+
     parser = MultipartParser(
         boundary,
         {
+            "on_end": on_end,
             "on_part_begin": on_part_begin,
             "on_header_field": on_header_field,
             "on_header_value": on_header_value,
@@ -144,9 +151,27 @@ async def stream_multipart_into(
         parser.finalize()
         if st["error"]:
             raise st["error"]
+        # 请求体必须带着结束边界走完。缺了它（客户端半路断了但 Content-Length 对得上，或分块传输被干净地
+        # 收尾）解析器不会报错，截断的内容会被当作完整文件落位——甚至覆盖掉同名的好文件
+        if not st["ended"]:
+            raise StoreError("multipart 请求体不完整（缺少结束边界）", status=400)
     except StoreError:
         writer.abort()
         raise
+    except asyncio.CancelledError:
+        # 客户端中途断开时 Sanic 取消 handler。CancelledError 不是 Exception，下面那个分支接不住，
+        # 不在这里清理，半截 .tmp 就永远留在磁盘上（2GB 的上传泄漏 2GB）
+        writer.abort()
+        raise
+    except OSError as e:
+        writer.abort()
+        if e.errno in (errno.ENOSPC, errno.EDQUOT):
+            logger.error("整传写盘失败（磁盘空间/配额）: %s", e)
+            raise StoreError("存储空间不足", status=507) from e
+        if e.errno == errno.EFBIG:
+            raise StoreError("文件超过存储系统允许的上限", status=413) from e
+        logger.error("整传写盘失败: %s", e, exc_info=True)
+        raise StoreError("存储写入失败", status=500) from e
     except Exception as e:  # 解析/写盘异常一律清理临时文件，避免半截 .tmp 泄漏
         writer.abort()
         logger.error("整传流式解析失败: %s", e, exc_info=True)

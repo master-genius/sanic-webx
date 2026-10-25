@@ -4,6 +4,9 @@
 会话目录、meta.json、超龄回收这套只在本模块。
 """
 
+import os
+import time
+
 import pytest
 
 from webx.lib.chunked_upload import ChunkedUpload, OffsetConflict
@@ -94,10 +97,53 @@ def test_cleanup_stale_sessions(store, chunked):
     meta = json.loads(meta_file.read_text())
     meta["created_ms"] -= int(48 * 3600 * 1000)
     meta_file.write_text(json.dumps(meta))
+    old = time.time() - 48 * 3600
+    os.utime(chunked.sessions_dir / stale / "part", (old, old))   # 陈旧 = 创建早且很久没有写入
 
     assert chunked.cleanup_stale(max_age_hours=24) == 1
     assert chunked.get(stale) is None
     assert chunked.get(fresh) is not None
+
+
+def test_cleanup_keeps_an_old_session_that_is_still_receiving_data(store, chunked):
+    """创建于 48 小时前、但刚刚还在追加分片的会话是活的：每个 worker 启动都会跑回收，
+    按创建时间判龄会把慢速大文件的上传整个删掉，客户端续传得到 404。"""
+    import json
+
+    uid = chunked.create("bucket/slow.bin")["upload_id"]
+    chunked.append(uid, 0, b"abc")
+    meta_file = chunked.sessions_dir / uid / "meta.json"
+    meta = json.loads(meta_file.read_text())
+    meta["created_ms"] -= int(48 * 3600 * 1000)
+    meta_file.write_text(json.dumps(meta))
+
+    assert chunked.cleanup_stale(max_age_hours=24) == 0
+    assert chunked.get(uid)["offset"] == 3
+
+
+def test_append_after_complete_cannot_pollute_the_published_object(store, chunked, monkeypatch):
+    """PATCH 已打开 part、尚未拿到锁时 complete 抢先落位：PATCH 拿到锁后必须发现 part 已不是会话的那个文件，
+    返回 404，而不是把数据追加进已发布的对象。（旧实现：complete 回报 5 字节，文件实际 25 字节。）"""
+    import fcntl
+
+    uid = chunked.create("bucket/race.bin", 5)["upload_id"]
+    chunked.append(uid, 0, b"12345")
+
+    real_flock = fcntl.flock
+    state = {"done": False}
+
+    def flock_after_complete(fd, op):
+        if op == fcntl.LOCK_EX and not state["done"]:
+            state["done"] = True
+            real_flock(fd, fcntl.LOCK_UN)
+            chunked.complete(uid)          # 在 PATCH 打开文件之后、拿锁之前完成上传
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", flock_after_complete)
+    with pytest.raises(StoreError) as ei:
+        chunked.append(uid, 5, b"EXTRA-AFTER-COMPLETE")
+    assert ei.value.status == 404
+    assert store.exists("bucket/race.bin").read_bytes() == b"12345", "已发布对象不得被污染"
 
 
 def test_cleanup_handles_broken_meta(store, chunked):

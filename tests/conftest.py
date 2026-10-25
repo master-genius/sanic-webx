@@ -186,6 +186,8 @@ def app_with_db(tmp_path_factory):
     # 写进仓库的 ./storage，而不是临时目录
     from webx.config import get_settings
     get_settings().STORAGE_DIR = str(tmp_path_factory.mktemp("storage"))
+    # 签名密钥必须显式配置：回落到 TOKEN_SECRET 的公开默认值时签名器会拒绝工作（fail-closed）
+    get_settings().STORAGE_SIGN_SECRET = "conftest-sign-secret-0123456789"
     # 其它用例可能已经用默认目录创建过全局存储门面，换目录后要丢掉它缓存的 store
     from webx.services.storage_service import storage_service
     storage_service._store = storage_service._chunked = storage_service._signer = None

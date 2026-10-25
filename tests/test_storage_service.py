@@ -418,7 +418,7 @@ def test_legacy_aliases_keep_the_old_contract_and_are_marked_deprecated(app):
     up = post_file(app, "/internal/tasks/L1/results/upload", filename="x.bin", data=b"12345")
     assert up.status == 200, "旧契约是 200，不是 201"
     assert up.json == {"task_id": "L1", "filename": "x.bin", "download_url": result_url("L1", "x.bin"), "size": 5}
-    assert up.headers["Deprecation"] == "true" and "/internal/tasks/{task_id}/results" in up.headers["Link"]
+    assert up.headers["Deprecation"] == "true" and up.headers["Link"] == '</internal/tasks/L1/results>; rel="successor-version"', "Link 里的 {task_id} 要用本次请求的路径参数展开"
 
     init = app.test_client.post("/internal/tasks/L1/results/upload/init", json={"filename": "y.bin"}, headers=H)[1]
     assert init.status == 200 and init.json["offset"] == 0 and init.headers["Deprecation"] == "true"
@@ -489,6 +489,8 @@ def test_startup_reclaims_stale_upload_sessions(make_app):
     data = _json.load(open(meta))
     data["created_ms"] = int((time.time() - 5 * 3600) * 1000)
     _json.dump(data, open(meta, "w"))
+    old = time.time() - 5 * 3600                      # 陈旧 = 创建早且很久没有写入
+    os.utime(os.path.join(os.path.dirname(meta), "part"), (old, old))
 
     app.test_client.get("/health")  # 触发 before_server_start 钩子
     assert not os.path.exists(os.path.dirname(meta)), "超龄会话必须在启动时被回收"
@@ -664,3 +666,51 @@ def test_retention_boundary(retention_store):
     _make_task_dir(retention_store.root, "outside", age_days=91)
     assert sweep(retention_store, MtimeRetention("tasks", days=90)) == (2, 1)
     assert (retention_store.root / "tasks" / "inside").exists()
+
+
+# ───────────────────────── 签名密钥 fail-closed ─────────────────────────
+
+
+def _fresh_service(monkeypatch, sign_secret, token_secret):
+    from webx.config import get_settings
+    from webx.services.storage_service import StorageService
+
+    cfg = get_settings()
+    monkeypatch.setattr(cfg, "STORAGE_SIGN_SECRET", sign_secret)
+    monkeypatch.setattr(cfg, "TOKEN_SECRET", token_secret)
+    return StorageService()
+
+
+def test_signer_refuses_to_work_on_the_public_default_secret(monkeypatch):
+    """没单独配 STORAGE_SIGN_SECRET，又回落到源码里公开的默认 TOKEN_SECRET：任何人都能自己签出有效签名。
+    必须拒绝签发（503），并且一律判校验无效，而不是形同虚设地照常工作。"""
+    from webx.config import DEFAULT_TOKEN_SECRET
+    from webx.lib.signer import UrlSigner
+    from webx.services.storage_service import SignerUnavailable
+
+    svc = _fresh_service(monkeypatch, "", DEFAULT_TOKEN_SECRET)
+    with pytest.raises(SignerUnavailable) as ei:
+        svc.sign("secret/doc.txt")
+    assert ei.value.status == 503
+    forged = UrlSigner(DEFAULT_TOKEN_SECRET, 3600).issue("secret/doc.txt")
+    assert svc.verify_sign(forged, "secret/doc.txt") is False, "用公开默认值伪造的签名必须被拒绝"
+
+
+def test_signer_refuses_empty_and_too_short_secrets(monkeypatch):
+    from webx.services.storage_service import SignerUnavailable
+
+    for token_secret in ("", "short"):
+        svc = _fresh_service(monkeypatch, "", token_secret)
+        with pytest.raises(SignerUnavailable):
+            svc.sign("a/b")
+        assert svc.verify_sign("anything", "a/b") is False
+
+
+def test_signer_works_with_an_explicit_or_nondefault_secret(monkeypatch):
+    from webx.config import DEFAULT_TOKEN_SECRET
+
+    svc = _fresh_service(monkeypatch, "explicit-sign-secret-123456", DEFAULT_TOKEN_SECRET)
+    assert svc.verify_sign(svc.sign("a/b"), "a/b") is True
+
+    svc = _fresh_service(monkeypatch, "", "a-real-non-default-token-secret")   # 回落但非默认：可用（并告警）
+    assert svc.verify_sign(svc.sign("a/b"), "a/b") is True

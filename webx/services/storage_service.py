@@ -17,16 +17,29 @@ from urllib.parse import quote
 
 from sanic.response import file_stream, text
 
-from webx.config import settings
+from webx.config import DEFAULT_TOKEN_SECRET, settings
 from webx.lib.ranges import UNSATISFIABLE, ByteRange, parse_byte_range
 from webx.lib.chunked_upload import ChunkedUpload
 from webx.lib.signer import UrlSigner
-from webx.lib.storage import ObjectStore
+from webx.lib.storage import ObjectStore, StoreError
 
 logger = logging.getLogger(__name__)
 
 # 下载分块大小：太小则系统调用频繁，太大则首字节延迟上升。1MB 是经验上的平衡点。
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+#: 允许 ``inline`` 展示的 MIME：纯文本与常见位图 / PDF。刻意不含 text/html、image/svg+xml、
+#: application/xhtml+xml 等能携带脚本的类型。
+SAFE_INLINE_TYPES = frozenset({
+    "text/plain", "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf",
+})
+
+
+class SignerUnavailable(StoreError):
+    """签名密钥未配置或不可用。签发回 503；校验一律判无效。"""
+
+    def __init__(self, message: str):
+        super().__init__(message, status=503)
 
 
 class StorageService:
@@ -55,11 +68,20 @@ class StorageService:
             secret = settings.STORAGE_SIGN_SECRET
             if not secret:
                 secret = settings.TOKEN_SECRET
+                if not secret or secret == DEFAULT_TOKEN_SECRET:
+                    # fail-closed：回落到空值或源码里公开的默认值，等于任何人都能自己签出有效签名。
+                    # 与内部令牌未配置时“拒绝一切”同一原则，宁可不能用，也不能形同虚设
+                    raise SignerUnavailable(
+                        "未配置签名密钥：请设置 STORAGE_SIGN_SECRET（或把 TOKEN_SECRET 改成非默认值）"
+                    )
                 logger.warning(
                     "STORAGE_SIGN_SECRET 未配置，回落 TOKEN_SECRET。"
                     "生产环境请单独配置，以便独立轮换。"
                 )
-            self._signer = UrlSigner(secret, settings.STORAGE_SIGN_TTL_SECONDS)
+            try:
+                self._signer = UrlSigner(secret, settings.STORAGE_SIGN_TTL_SECONDS)
+            except ValueError as e:  # 密钥过短等：启动后第一次用就明确报错，而不是每个请求都 500
+                raise SignerUnavailable(f"签名密钥不可用: {e}") from None
         return self._signer
 
     @property
@@ -84,7 +106,12 @@ class StorageService:
         return self.signer.issue(object_key, ttl_seconds)
 
     def verify_sign(self, sign: str, object_key: str) -> bool:
-        return self.signer.verify(sign, object_key)
+        try:
+            signer = self.signer
+        except SignerUnavailable as e:
+            logger.error("拒绝签名校验: %s", e)   # 密钥不可用 = 一律不放行（调用方据此回 404）
+            return False
+        return signer.verify(sign, object_key)
 
     # ==================== 下载 ====================
 
@@ -113,6 +140,7 @@ class StorageService:
         range_header: Optional[str] = None,
         inline: bool = False,
         content_type: Optional[str] = None,
+        extra_headers: Optional[dict] = None,
     ):
         """构造下载响应：流式 + 断点续传。
 
@@ -130,6 +158,15 @@ class StorageService:
         file_size = path.stat().st_size
         name = download_name or path.name
 
+        # 内联展示只对“浏览器不会当脚本执行”的类型放行。上传者可控内容，把 .html/.svg 内联在存储域名下
+        # 就是同源脚本执行（存储域名常与其它应用同源）；其余类型降级为附件下载
+        if inline:
+            import mimetypes
+
+            mime = (content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream").split(";")[0]
+            if mime not in SAFE_INLINE_TYPES:
+                inline = False
+
         headers = {
             # RFC 5987 编码，兼容中文与特殊字符文件名
             "Content-Disposition": (
@@ -137,6 +174,10 @@ class StorageService:
             ),
             # 声明支持断点续传，浏览器/下载器据此分段取
             "Accept-Ranges": "bytes",
+            # 禁止浏览器按内容嗅探成别的类型；内联时再加沙箱，即使类型判断有漏也不能执行脚本
+            "X-Content-Type-Options": "nosniff",
+            **({"Content-Security-Policy": "sandbox"} if inline else {}),
+            **(extra_headers or {}),
         }
 
         parsed = parse_byte_range(range_header, file_size)
