@@ -550,6 +550,10 @@ def test_stale_upload_sessions_are_reclaimed_by_prepare_storage(tmp_path, monkey
     data = json.loads(meta.read_text())
     data["created_ms"] = int((time.time() - 3 * 3600) * 1000)
     meta.write_text(json.dumps(data))
+    import os
+
+    aged = time.time() - 3 * 3600                     # 陈旧 = 创建早且很久没有写入
+    os.utime(storage_service.chunked.sessions_dir / old / "part", (aged, aged))
 
     core_app._prepare_storage()
 

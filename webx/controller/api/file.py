@@ -26,6 +26,7 @@ from webx.lib.deprecated_alias import deprecated_alias
 from webx.lib.storage import StoreError
 from webx.services.storage_http import (
     append_chunk,
+    json_object,
     decode_param,
     receive_multipart,
     store_error_response,
@@ -40,6 +41,21 @@ file_bp = Blueprint("webx_file", url_prefix="/api/files")
 #: 旧路径 ``/api/files/uploads/<id>`` 与 ``/api/files/<bucket>/<filename>`` 同形，
 #: 名为 ``uploads`` 的 bucket 里的文件会被会话路由遮住，下载不到。
 upload_bp = Blueprint("webx_upload", url_prefix="/api/uploads")
+
+
+#: 通用文件接口不得触碰的键根。``tasks/`` 属于任务模块（输入文件、产物），归属校验在任务接口里做；
+#: 这里若放行，任何登录用户用 ``tasks%2F<任务id>%2Ffiles`` 当 bucket（Sanic 不解码路径参数，匹配得上）
+#: 就能读、写、删、签名他人任务的文件。任务 id 还是可推算的。
+RESERVED_ROOTS = frozenset({"tasks"})
+
+
+def _bucket(raw: str) -> str:
+    """解码 bucket，并拒绝落进保留命名空间的值（含 ``/tasks/..``、``tasks\\..`` 这类归一化后等价的写法）。"""
+    bucket = decode_param(raw)
+    root = bucket.replace("\\", "/").lstrip("/").split("/", 1)[0]
+    if root in RESERVED_ROOTS:
+        raise StoreError("该命名空间由任务模块管理，请使用任务接口", status=403)
+    return bucket
 
 
 def _key(bucket: str, name: str) -> str:
@@ -61,7 +77,7 @@ async def upload(request: Request, bucket: str):
     请求体是 ``multipart/form-data``，取其中第一个文件部分；可选表单字段
     ``filename`` 覆盖文件部分自带的文件名。超过 ``UPLOAD_MAX_SIZE`` 立即中止并清理临时文件。
     """
-    bucket = decode_param(bucket)
+    bucket = _bucket(bucket)
     lang = get_lang_from_header(request.headers)
 
     try:
@@ -105,16 +121,18 @@ async def upload_init(request: Request, bucket: str):
 
     body: ``{"filename": "big.zip", "total": 12345}``（total 可省，省则不校验总长）
     """
-    bucket = decode_param(bucket)
-    body = request.json or {}
+    bucket = _bucket(bucket)
+    body = json_object(request)
     filename = str(body.get("filename") or "").strip()
     if not filename:
         return json({"error": "filename 必填"}, status=400)
+    try:
+        total = int(body.get("total", -1))
+    except (TypeError, ValueError, OverflowError):
+        return json({"error": "total 必须是整数"}, status=400)
 
     try:
-        session = storage_service.chunked.create(
-            _key(bucket, filename), int(body.get("total", -1))
-        )
+        session = storage_service.chunked.create(_key(bucket, filename), total)
     except StoreError as e:
         return _store_error(request, e)
     return json({"data": session}, status=201)
@@ -175,7 +193,7 @@ async def upload_abort(request: Request, upload_id: str):
 @file_bp.get("/<bucket:str>")
 async def list_files(request: Request, bucket: str):
     """列出该 bucket 下的文件名。"""
-    bucket = decode_param(bucket)
+    bucket = _bucket(bucket)
     return json({"data": {"files": storage_service.store.list_prefix(bucket)}})
 
 
@@ -185,7 +203,7 @@ async def download(request: Request, bucket: str, filename: str):
 
     ``?name=`` 可指定呈现给用户的文件名；``?inline=1`` 让浏览器内联展示。
     """
-    bucket = decode_param(bucket)
+    bucket = _bucket(bucket)
     filename = decode_param(filename)
     lang = get_lang_from_header(request.headers)
     path = storage_service.store.exists(_key(bucket, filename))
@@ -203,7 +221,7 @@ async def download(request: Request, bucket: str, filename: str):
 @file_bp.head("/<bucket:str>/<filename:str>")
 async def head_file(request: Request, bucket: str, filename: str):
     """探测对象：存在则回长度与 ``Accept-Ranges``，不传文件体。"""
-    bucket = decode_param(bucket)
+    bucket = _bucket(bucket)
     filename = decode_param(filename)
     path = storage_service.store.exists(_key(bucket, filename))
     if not path:
@@ -214,22 +232,25 @@ async def head_file(request: Request, bucket: str, filename: str):
 @file_bp.post("/<bucket:str>/<filename:str>/signatures")
 async def issue_sign(request: Request, bucket: str, filename: str):
     """签发限时下载链接，供无需登录的场景（分享、第三方回源）使用。"""
-    bucket = decode_param(bucket)
+    bucket = _bucket(bucket)
     filename = decode_param(filename)
     key = _key(bucket, filename)
     if not storage_service.store.exists(key):
         return json({"error": t("not_found", get_lang_from_header(request.headers))}, status=404)
 
-    body = request.json or {}
-    ttl = body.get("ttl_seconds")
-    sign = storage_service.sign(key, int(ttl) if ttl else None)
+    body = json_object(request)
+    try:
+        ttl = int(body["ttl_seconds"]) if body.get("ttl_seconds") else None
+    except (TypeError, ValueError, OverflowError):
+        return json({"error": "ttl_seconds 必须是整数"}, status=400)
+    sign = storage_service.sign(key, ttl)
     return json({"data": {"key": key, "sign": sign, "url": f"/public/files/{key}?sign={sign}"}})
 
 
 @file_bp.delete("/<bucket:str>/<filename:str>")
 async def delete_file(request: Request, bucket: str, filename: str):
     """删除文件。"""
-    bucket = decode_param(bucket)
+    bucket = _bucket(bucket)
     filename = decode_param(filename)
     lang = get_lang_from_header(request.headers)
     if not storage_service.store.delete(_key(bucket, filename)):

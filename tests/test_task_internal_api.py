@@ -482,3 +482,23 @@ def test_workers_download_the_task_input_files(client, dsn):
     assert got.status == 200 and got.body == b"payload"
     assert client.get(f"/internal/tasks/{tid}/files/nope.bin", headers=wk())[1].status == 404
     assert client.get(f"/internal/tasks/{tid}/files/..%2F..%2Fetc%2Fpasswd", headers=wk())[1].status == 404, "路径穿越走存储层守卫"
+
+
+# ==================== 审查修复 ====================
+
+
+def test_out_of_range_lease_seq_is_treated_as_malformed_not_500(client, dsn):
+    """lease_seq 列是 int32：超范围的值以前会让 ack / DELETE lease 在 SQL 里抛错（500）。现在等同“没有令牌”。"""
+    tid = create_submit(client)
+    h = {"X-Internal-Token": TOKEN, "X-Worker-Id": "w1", "X-Lease-Seq": "99999999999999999999"}
+    assert client.post(f"/internal/tasks/{tid}/ack", headers=h)[1].status == 403
+    assert client.delete(f"/internal/tasks/{tid}/lease", headers=h)[1].status == 403
+
+
+def test_terminal_states_must_go_through_complete_or_fail(client, dsn):
+    """PUT status=completed/failed 以前能直接设终态：lease_until 不清、sub_status 仍是 pending、事件不触发。"""
+    tid, h = running(client, dsn)
+    for s in ("completed", "failed", "cancelled"):
+        _, r = client.put(f"/internal/tasks/{tid}/status", json={"status": s}, headers=h)
+        assert r.status == 400 and r.json["code"] == "use_complete_or_fail", s
+    assert db(dsn, tid)["status"] == "running"

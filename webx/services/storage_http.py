@@ -26,7 +26,11 @@ def decode_param(value: str) -> str:
     必须在**键规则校验之前**解码：``%2e%2e``、``%2F`` 这类编码过的穿越尝试
     解码后会被 ``normalize_key`` 当作 ``..`` / 分隔符拦下，而不是绕过校验。
     """
-    return unquote(value)
+    decoded = unquote(value)
+    if "\x00" in decoded:
+        # NUL 既是路径穿越的经典手法，PostgreSQL 的文本列也拒收它（到查询阶段才 500）：入口统一挡成 400
+        raise StoreError("参数不得包含 NUL 字符", status=400)
+    return decoded
 
 
 def json_object(request: Request) -> dict:

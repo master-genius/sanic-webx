@@ -508,6 +508,9 @@ def extract_fencing(request) -> tuple[str, int | None]:
         lease_seq = int(raw_seq) if raw_seq is not None else None
     except (TypeError, ValueError):
         lease_seq = None  # 令牌畸形 = 没有令牌
+    # 列是 integer：超出 int32 的值会让 SQL 抛 out of range（500）。代次从 0 起单调递增，越界必为伪造 / 畸形
+    if lease_seq is not None and not (0 <= lease_seq <= 2**31 - 1):
+        lease_seq = None
 
     return worker_id, lease_seq
 

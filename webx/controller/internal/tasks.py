@@ -132,6 +132,10 @@ async def put_status(request: Request, task_id: str, body: TaskStatusUpdateReque
         new_status = TaskStatus(body.status)
     except ValueError:
         return json({"error": t("task_status_invalid", lang)}, status=400)
+    if new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        # 终态必须走 /complete 与 /fail：只有它们会释放租约、置 sub_status、触发事件、处理多阶段的中间步。
+        # 这里直接设终态会留下 lease_until 未清、sub_status 仍是 pending 的半截状态
+        return json({"error": "终态请使用 POST .../complete 或 .../fail", "code": "use_complete_or_fail"}, status=400)
     try:
         await task_service.update_status(task, new_status, error_message=body.error_message)
     except ValueError as e:

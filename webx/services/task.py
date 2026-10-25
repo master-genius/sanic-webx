@@ -170,6 +170,8 @@ class TaskService:
     @classmethod
     async def get_tasks_by_ids(cls, task_ids: list[str], user_id: Optional[str] = None) -> list[Task]:
         """按 id 批量取（轻量轮询用）。传 user_id 则只返回该用户的，非本人 / 不存在的静默跳过。"""
+        if user_id is not None and not user_id:
+            return []                      # 传了空的 user_id = 没有身份，不是“不过滤”
         q = Task.filter(id__in=task_ids, is_delete=False)
         if user_id:
             q = q.filter(user_id=user_id)

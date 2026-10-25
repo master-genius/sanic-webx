@@ -9,22 +9,58 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _jsonish(v: Any) -> Any:
-    """把 dict / list 规整成 JSON 文本；字符串原样；其余拒绝。"""
-    if v is None or isinstance(v, str):
+    """把 dict / list 规整成 JSON 文本；字符串必须本身是合法 JSON（对象 / 数组）；其余拒绝。
+
+    字符串原先原样放行：``"not json"`` 会被存进库、发给 worker，而 ``parse_params`` 静默把它当成 ``{}``，
+    用户的参数就这样无声丢了。PostgreSQL 的文本列还不接受 NUL（会 500）。
+    """
+    if v is None:
+        return v
+    if isinstance(v, str):
+        if v == "":
+            return v
+        if "\x00" in v:
+            raise ValueError("不得包含 NUL 字符")
+        try:
+            parsed = json.loads(v)
+        except ValueError:
+            raise ValueError("params_text 必须是 JSON 对象") from None
+        if not isinstance(parsed, (dict, list)):
+            raise ValueError("params_text 必须是 JSON 对象")
         return v
     if isinstance(v, (dict, list)):
         return json.dumps(v, ensure_ascii=False)
     raise ValueError("必须是 JSON 对象或 JSON 字符串")
 
 
+def _jsonish_field(v: Any) -> Any:
+    """worker 回写 result_path / log_path：字符串原样（旧契约允许普通字符串），dict / list 转 JSON 文本。"""
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    raise ValueError("必须是 JSON 对象或字符串")
+
+
+class _NoNul(BaseModel):
+    """字符串字段不得含 NUL：PostgreSQL 拒收，落库时会变成 500。"""
+
+    @model_validator(mode="after")
+    def _reject_nul(self):
+        for name, value in self.__dict__.items():
+            if isinstance(value, str) and "\x00" in value:
+                raise ValueError(f"{name} 不得包含 NUL 字符")
+        return self
+
+
 # ==================== 用户接口：请求 ====================
 
 
-class TaskCreateRequest(BaseModel):
+class TaskCreateRequest(_NoNul):
     task_type: str = Field(min_length=1, max_length=64)
     name: str = Field(default="", max_length=128)
     params_text: Optional[Any] = None
@@ -38,7 +74,7 @@ class TaskCreateRequest(BaseModel):
         return _jsonish(v)
 
 
-class TaskPatchRequest(BaseModel):
+class TaskPatchRequest(_NoNul):
     """编辑 / 推进任务。
 
     - 草稿态：改 ``params_text`` / ``step``，``submit=true``（默认）则同时提交
@@ -55,7 +91,7 @@ class TaskPatchRequest(BaseModel):
         return _jsonish(v)
 
 
-class TaskInfoUpdateRequest(BaseModel):
+class TaskInfoUpdateRequest(_NoNul):
     """与计算无关的辅助信息；不判断任务状态，任意状态均可改。"""
 
     name: Optional[str] = Field(default=None, max_length=128)
@@ -81,7 +117,7 @@ class TaskRetryRequest(BaseModel):
         return _jsonish(v)
 
 
-class TaskRedoRequest(BaseModel):
+class TaskRedoRequest(_NoNul):
     step: str = Field(min_length=1, max_length=30)
     params_text: Optional[Any] = None
 
@@ -115,7 +151,7 @@ class TaskFieldUpdateRequest(BaseModel):
     @field_validator("result_path", "log_path", mode="before")
     @classmethod
     def _jsonish_fields(cls, v):
-        return _jsonish(v)
+        return _jsonish_field(v)
 
 
 class TaskFailRequest(BaseModel):

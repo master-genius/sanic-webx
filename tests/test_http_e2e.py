@@ -926,3 +926,28 @@ def test_upload_session_routes_require_login_on_both_canonical_and_alias(http_ap
     ):
         _, resp = getattr(c, method)(path)
         assert resp.status == 401, (method, path, resp.status)
+
+
+# ==================== 审查修复：通用文件接口不得触碰 tasks/ 命名空间 ====================
+
+
+def test_generic_file_api_cannot_reach_the_task_namespace(http_app, captured_codes_module):
+    """任何登录用户都不能用 bucket=tasks%2F<任务id>%2Ffiles 去读写删签别人任务的文件（Sanic 不解码路径参数，
+    这种 bucket 能匹配 <bucket:str>，decode_param 之后就成了 tasks/<id>/files）。"""
+    headers = _alias_headers(http_app, captured_codes_module)
+    c = http_app.test_client
+    for bucket in ("tasks", "tasks%2FT1%2Ffiles", "%2Ftasks%2FT1%2Ffiles", "tasks%5CT1", "tasks%2FT1%2Fresults"):
+        body, ct = _multipart("evil.txt", b"x")
+        for method, path, kw in (
+            ("post", f"/api/files/{bucket}", {"data": body, "headers": {**headers, **ct}}),
+            ("get", f"/api/files/{bucket}", {"headers": headers}),
+            ("get", f"/api/files/{bucket}/in.txt", {"headers": headers}),
+            ("delete", f"/api/files/{bucket}/in.txt", {"headers": headers}),
+            ("post", f"/api/files/{bucket}/in.txt/signatures", {"headers": headers}),
+            ("post", f"/api/files/{bucket}/uploads", {"json": {"filename": "a.bin"}, "headers": headers}),
+        ):
+            _, resp = getattr(c, method)(path, **kw)
+            assert resp.status == 403, (method, path, resp.status)
+    # 普通 bucket 不受影响
+    body, ct = _multipart("ok.txt", b"ok")
+    assert c.post("/api/files/normal", data=body, headers={**headers, **ct})[1].status == 201

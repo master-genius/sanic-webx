@@ -106,6 +106,8 @@ class Stack:
             "DATABASE_HOST": u.hostname, "DATABASE_PORT": str(u.port), "DATABASE_NAME": u.path.lstrip("/"),
             "DATABASE_USER": u.username or "postgres", "DATABASE_PASSWORD": u.password or "",
             "TOKEN_SECRET": self.token_secret, "INTERNAL_TOKEN": INTERNAL_TOKEN,
+            # 签名密钥必须显式配置：回落到 TOKEN_SECRET 的默认值时签名器 fail-closed，storage verify 的签名一步会 503
+            "STORAGE_SIGN_SECRET": "stack-e2e-sign-secret-0123456789",
             "STORAGE_INTERNAL_URL": self.storage, "TASK_SERVER_URL": self.task,
             "TASK_SERVER_HOST": "127.0.0.1", "TASK_SERVER_PORT": str(self.task_port),
             "SERVER_HOST": "127.0.0.1", "SERVER_PORT": str(self.web_port),

@@ -632,3 +632,86 @@ def test_aggregate_gate_blocks_until_children_of_that_step_complete(dsn, types):
     first, second = _admit(dsn, go)
     assert first == (["m1", "m2"], [], 2), "缺失的子任务也算未就绪（expected_child_tags）"
     assert second == (["m2"], [])
+
+
+# ==================== 审查修复：授权 / 输入校验 ====================
+
+
+def test_empty_owner_is_not_a_wildcard(client, dsn):
+    """库里 user_id 为空的任务，不能被别的用户访问；令牌没有身份时 ids 轮询也不能带回别人的任务。"""
+    t = create(client, "owner1")
+    execute(dsn, "UPDATE tasks SET user_id='' WHERE id=$1", t["id"])
+    assert client.get(f"/api/tasks/{t['id']}", headers=auth("mallory"))[1].status == 403
+    assert client.put(f"/api/tasks/{t['id']}/info", json={"name": "x"}, headers=auth("mallory"))[1].status == 403
+    assert client.delete(f"/api/tasks/{t['id']}", headers=auth("mallory"))[1].status == 403
+
+    other = create(client, "owner2")
+    _, r = client.get(f"/api/tasks?ids={other['id']}", headers=auth(""))
+    assert r.json["data"] == [], "没有身份的令牌不能用 ids 带回别人的任务"
+
+
+def test_children_cannot_be_submitted_revised_or_redone_by_users(client, dsn):
+    """子任务由系统准入闸管理：用户逐个 revise + submit 会绕过子任务独立的额度池与重试预算。"""
+    parent, child = create(client, "pc"), create(client, "pc")
+    execute(dsn, "UPDATE tasks SET parent_id=$1, status='failed' WHERE id=$2", parent["id"], child["id"])
+    h = auth("pc")
+    for method, path, body in (
+        ("post", f"/api/tasks/{child['id']}/revise", None),
+        ("post", f"/api/tasks/{child['id']}/redo", {"step": "s"}),
+        ("patch", f"/api/tasks/{child['id']}", {"params_text": {}}),
+    ):
+        kw = {"headers": h, **({"json": body} if body is not None else {})}
+        assert getattr(client, method)(path, **kw)[1].status == 409, (method, path)
+    execute(dsn, "UPDATE tasks SET status='draft' WHERE id=$1", child["id"])
+    assert client.post(f"/api/tasks/{child['id']}/submit", json={}, headers=h)[1].status == 409
+
+
+def test_nul_bytes_and_huge_pages_are_client_errors_not_500(client):
+    h = auth("nul")
+    assert client.get("/api/tasks/%00", headers=h)[1].status == 400
+    assert client.get("/api/tasks?ids=%00", headers=h)[1].status == 400
+    assert client.get("/api/tasks?task_type=%00", headers=h)[1].status == 400
+    assert client.post("/api/tasks", json={"task_type": "demo", "name": "a\u0000b"}, headers=h)[1].status == 400
+    assert client.get("/api/tasks?page=99999999999999999999", headers=h)[1].status == 200, "page 被钳到上限，不是 500"
+
+
+def test_params_text_string_must_be_a_json_object(client):
+    """"not json" 以前会被存进库发给 worker，而 parse_params 静默当成 {}——用户的参数就这样丢了。"""
+    h = auth("pj")
+    for bad in ("not json", "123", '"x"'):
+        _, r = client.post("/api/tasks", json={"task_type": "demo", "params_text": bad}, headers=h)
+        assert r.status == 400, bad
+    _, r = client.post("/api/tasks", json={"task_type": "demo", "params_text": '{"a": 1}'}, headers=h)
+    assert r.status == 201
+
+
+def test_create_with_submit_that_is_rejected_leaves_no_orphan(client, dsn, types):
+    """前置闸拒绝时，刚创建的任务不能留成占每日额度、又无从找回 id 的孤儿。"""
+    from webx.lib.task_errors import ParamsError
+
+    def deny(params):
+        raise ParamsError("nope")
+
+    types(TaskTypeSpec(name="denies", validate_params=deny))
+    before = fetch(dsn, "SELECT count(*) AS n FROM tasks WHERE user_id='orph' AND is_delete=false")[0]["n"]
+    _, r = client.post("/api/tasks", json={"task_type": "denies", "submit": True}, headers=auth("orph"))
+    assert r.status >= 400
+    after = fetch(dsn, "SELECT count(*) AS n FROM tasks WHERE user_id='orph' AND is_delete=false")[0]["n"]
+    assert after == before
+
+
+def test_input_file_upload_during_submit_does_not_pull_the_task_back_to_draft(client, dsn):
+    """上传期间任务被提交：结束时不能用旧状态把它写回 DRAFT（任务会从池里消失）。直接对行锁更新函数做断言。"""
+    import asyncio
+
+    from webx.controller.api.task import _update_input_files
+
+    t = create(client, "up")
+    execute(dsn, "UPDATE tasks SET status='pending' WHERE id=$1", t["id"])
+
+    async def go():
+        return await _update_input_files(t["id"], lambda fs: fs + [{"name": "x"}], to_draft=True)
+
+    assert orm(dsn, go) is False
+    row = fetch(dsn, "SELECT status, files_json FROM tasks WHERE id=$1", t["id"])[0]
+    assert row["status"] == "pending" and "x" not in (row["files_json"] or "")

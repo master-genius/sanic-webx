@@ -33,7 +33,7 @@ async def list_tasks(request: Request):
         return _forbidden()
     lang = get_lang_from_header(request.headers)
     try:
-        page = max(1, int(request.args.get("page", "1")))
+        page = min(1_000_000, max(1, int(request.args.get("page", "1"))))
         page_size = min(MAX_PAGE_SIZE, max(1, int(request.args.get("page_size", "20"))))
     except ValueError:
         return json({"error": t("invalid_params", lang)}, status=400)

@@ -54,6 +54,7 @@ task_bp = Blueprint("webx_task", url_prefix="/api/tasks")
 #: 批量状态查询单次上限
 STATUS_BATCH_LIMIT = 100
 MAX_PAGE_SIZE = 100
+MAX_PAGE = 1_000_000
 
 
 # ==================== 公共小工具 ====================
@@ -70,7 +71,9 @@ async def _owned(request: Request, task_id: str):
     task = await task_service.get_task(task_id)
     if not task or task.is_delete:
         return None, json({"error": t("task_not_found", lang)}, status=404)
-    if task.user_id and task.user_id != _user_id(request):
+    uid = _user_id(request)
+    # 令牌没有身份、或任务没有 owner，都不能“放行”：空串不是通配符
+    if not uid or task.user_id != uid:
         return None, json({"error": t("unauthorized_task", lang)}, status=403)
     return task, None
 
@@ -83,6 +86,17 @@ def _bad(lang: str, exc: Exception, status: int = 400):
     if isinstance(exc, StepValidationError):
         return json({"error": t(exc.code, lang, **exc.context), "code": exc.code}, status=status)
     return json({"error": str(exc)}, status=status)
+
+
+def _reject_child(task: Task, lang: str):
+    """子任务的提交 / 编辑 / 改写 / 重做都由系统（准入闸门）管理。
+
+    用户侧直接 submit_task 会绕过子任务独立的额度池与重试预算（逐个 revise + submit 就能把全部失败的子任务
+    一起塞进池里）；唯一的用户入口是 retry，它走 readmit_child 挂回准入闸。
+    """
+    if task.parent_id:
+        return json({"error": t("child_managed_by_system", lang)}, status=409)
+    return None
 
 
 def _guard_auto_post(task: Task, lang: str):
@@ -110,7 +124,13 @@ async def create_task(request: Request, body: TaskCreateRequest):
         name=body.name,
     )
     if body.submit:
-        if not await task_service.submit_task(task):
+        try:
+            submitted = await task_service.submit_task(task)
+        except BaseException:
+            # 前置闸（额度 / 参数 / 点数）拒绝时，刚创建的任务不能留成占每日额度、又无从找回 id 的孤儿
+            await task_service.delete_task(task)
+            raise
+        if not submitted:
             return json({"error": t("service_unavailable", lang), "data": _view(task)}, status=503)
         task = await task_service.get_task(task.id)
     return json({"message": t("success", lang), "data": _view(task)}, status=201)
@@ -126,6 +146,10 @@ async def list_tasks(request: Request):
     lang = get_lang_from_header(request.headers)
     uid = _user_id(request)
 
+    # 查询串里的 NUL（%00）：PostgreSQL 文本列拒收，到查询阶段才炸成 500
+    if any("\x00" in v for vals in request.args.values() for v in vals):
+        return json({"error": t("invalid_params", lang)}, status=400)
+
     ids_raw = request.args.get("ids")
     if ids_raw is not None:
         ids = [i for i in dict.fromkeys(x.strip() for x in ids_raw.split(",")) if i]
@@ -135,7 +159,8 @@ async def list_tasks(request: Request):
         return json({"data": [TaskStatusBrief.model_validate(x).model_dump(mode="json") for x in tasks]})
 
     try:
-        page = max(1, int(request.args.get("page", "1")))
+        # page 设上限：OFFSET 超过 int64 会让 PostgreSQL 报错（500）
+        page = min(MAX_PAGE, max(1, int(request.args.get("page", "1"))))
         page_size = min(MAX_PAGE_SIZE, max(1, int(request.args.get("page_size", "20"))))
     except ValueError:
         return json({"error": t("invalid_params", lang)}, status=400)
@@ -178,6 +203,8 @@ async def list_children(request: Request, task_id: str):
     if err:
         return err
     step = request.args.get("parent_step")
+    if step and "\x00" in step:
+        return json({"error": t("invalid_params", get_lang_from_header(request.headers))}, status=400)
     children = await task_service.get_children(task.id, parent_step=step)
     return json({"data": [_view(c) for c in children]})
 
@@ -198,6 +225,8 @@ async def patch_task(request: Request, task_id: str, body: TaskPatchRequest):
     task, err = await _owned(request, decode_param(task_id))
     if err:
         return err
+    if guard := _reject_child(task, lang):
+        return guard
     if guard := _guard_auto_post(task, lang):
         return guard
     case = task_service.editable_case(task)
@@ -236,6 +265,8 @@ async def submit_task(request: Request, task_id: str, body: TaskSubmitRequest):
     task, err = await _owned(request, decode_param(task_id))
     if err:
         return err
+    if guard := _reject_child(task, lang):
+        return guard
     if task.status not in (TaskStatus.NONE, TaskStatus.DRAFT, ""):
         return json({"error": t("submit_only_draft", lang, status=task.status)}, status=400)
     if guard := _guard_auto_post(task, lang):
@@ -297,6 +328,8 @@ async def revise_task(request: Request, task_id: str):
     task, err = await _owned(request, decode_param(task_id))
     if err:
         return err
+    if guard := _reject_child(task, lang):
+        return guard
     try:
         updated = await task_service.revise_task(task)
     except ValueError as e:
@@ -311,6 +344,8 @@ async def redo_task(request: Request, task_id: str, body: TaskRedoRequest):
     task, err = await _owned(request, decode_param(task_id))
     if err:
         return err
+    if guard := _reject_child(task, lang):
+        return guard
     try:
         updated = await task_service.redo_task(task, body.step, params_text=body.params_text)
     except ValueError as e:
@@ -352,6 +387,25 @@ def _editable_inputs(task: Task) -> bool:
     return task.status in (TaskStatus.NONE, TaskStatus.DRAFT, "") and task.auto_post != 1
 
 
+async def _update_input_files(task_id: str, mutate, *, to_draft: bool = False) -> bool:
+    """在行锁内重读任务、确认仍可编辑，再改 files_json。返回是否成功。
+
+    读-改-写不加锁时，并发上传会互相覆盖（丢条目）；而且上传是流式的、窗口很宽——上传期间用户提交了任务，
+    结束时又用上传开始时的旧状态把它写回 DRAFT，任务就从池里消失了。
+    """
+    from tortoise.transactions import in_transaction
+
+    async with in_transaction():
+        row = await Task.filter(id=task_id).select_for_update().first()
+        if row is None or not _editable_inputs(row):
+            return False
+        data = {"files_json": jsonlib.dumps(mutate(parse_files(row.files_json)), ensure_ascii=False)}
+        if to_draft and row.status in (TaskStatus.NONE, ""):
+            data["status"] = TaskStatus.DRAFT
+        await Task.filter(id=task_id).update(**data)
+    return True
+
+
 @task_bp.post("/<task_id:str>/files", stream=True)
 async def upload_file(request: Request, task_id: str):
     """上传一个输入文件（multipart，流式落盘）。同名覆盖。"""
@@ -363,20 +417,26 @@ async def upload_file(request: Request, task_id: str):
     if not _editable_inputs(task):
         return json({"error": t("task_file_forbidden", lang)}, status=409)
 
+    writer = None
     try:
         writer = storage_service.store.open_writer(_files_key(task.id))
         parsed = await receive_multipart(request, writer)
         filename = (parsed.fields.get("filename") or parsed.filename or "").strip()
         final = writer.finalize(filename)
     except StoreError as e:
+        if writer is not None:
+            writer.abort()          # 文件名非法等：tmp 要清掉，否则每次最多泄漏 UPLOAD_MAX_SIZE
         return store_error_response(e)
 
     entry = {"name": final.name, "size": writer.size}
-    files = [f for f in parse_files(task.files_json) if f.get("name") != final.name] + [entry]
-    await Task.filter(id=task.id).update(
-        files_json=jsonlib.dumps(files, ensure_ascii=False),
-        status=TaskStatus.DRAFT if task.status in (TaskStatus.NONE, "") else task.status,
-    )
+
+    def add(files: list) -> list:
+        return [f for f in files if f.get("name") != final.name] + [entry]
+
+    if not await _update_input_files(task.id, add, to_draft=True):
+        # 上传期间任务已被提交 / 开始运行：输入不能再变（worker 可能已拿走旧的）
+        storage_service.store.delete(_files_key(task.id, final.name))
+        return json({"error": t("task_file_forbidden", lang)}, status=409)
     return json({"message": t("success", lang), "data": entry}, status=201)
 
 
@@ -412,9 +472,8 @@ async def delete_file(request: Request, task_id: str, name: str):
     files = parse_files(task.files_json)
     if not any(f.get("name") == name for f in files):
         return json({"error": t("task_file_not_found", lang)}, status=404)
+    if not await _update_input_files(task.id, lambda fs: [f for f in fs if f.get("name") != name]):
+        return json({"error": t("task_file_forbidden", lang)}, status=409)
     storage_service.store.delete(_files_key(task.id, name))
-    await Task.filter(id=task.id).update(
-        files_json=jsonlib.dumps([f for f in files if f.get("name") != name], ensure_ascii=False)
-    )
     return json({"message": t("success", lang)})
 
