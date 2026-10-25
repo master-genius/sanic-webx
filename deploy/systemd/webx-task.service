@@ -1,0 +1,35 @@
+[Unit]
+Description=webx 领取服务（worker 长连接领任务）
+# 只依赖网络与数据库：分发的唯一权威是 tasks 表的 PENDING 池，本服务重启不丢任何东西
+#（挂起中的领取请求断开后 worker 自会重连再领）。
+After=network.target
+
+[Service]
+Type=simple
+# ⚠️ 路径与运行用户按实际部署修改（默认 /opt/webx + www-data）。User 必须能读写 STORAGE_DIR / 日志目录
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/webx
+
+# server.sh 负责选解释器（.venv > uv > python3）并 exec 到服务本体：MainPID 即服务，SIGTERM 直达。
+# ⚠️ 刻意不在这里写任何参数：优先级是【命令行 > 环境变量 > .env > 默认值】，写死了改 .env 就不生效，
+# 且没有任何报错。监听地址、端口、租约参数、各类间隔一律只在 /opt/webx/.env 里配。
+ExecStart=/opt/webx/server.sh task
+# ⚠️ 必须单进程：挂起中的领取请求全部活在这一个进程的事件循环里，多开会把挂起池切成
+# 互不可见的几份，web 的一次 poke 只能唤醒其中一份，其余 worker 要等兜底轮询。入口本身也写死了单进程。
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=webx-task
+
+[Install]
+WantedBy=multi-user.target
