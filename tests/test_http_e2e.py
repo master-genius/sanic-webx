@@ -701,3 +701,118 @@ def test_register_and_login_codes_still_reach_unregistered(http_app, captured_co
         )
         assert resp.status == 200, f"{biz} 被误伤: {resp.text}"
         assert len(captured_codes_module) == before + 1
+
+
+# ==================== 存储契约：Upload-Offset 头 / 分片限制 / HEAD / 表单 filename ====================
+
+
+@pytest.fixture(scope="module")
+def sh(http_app, captured_codes_module):
+    """本组共用的已登录请求头。
+
+    每个用例各注册一个用户会各发一次验证码，整个测试会话很快就撞上
+    IP 限流（IP_RATE_LIMIT_PER_MIN）——那是被测功能本身在工作，不是缺陷。
+    """
+    return _auth(http_app, captured_codes_module, "storagecontract", "storagecontract@example.com")
+
+
+def _new_session(app, headers, bucket, filename="x.bin", total=-1):
+    _, init = app.test_client.post(
+        f"/api/files/{bucket}/uploads", json={"filename": filename, "total": total}, headers=headers
+    )
+    assert init.status == 201, init.text
+    return init.json["data"]["upload_id"]
+
+
+def test_chunk_responses_carry_upload_offset_header(http_app, sh):
+    """断点续传客户端读 Upload-Offset 头；JSON 客户端读顶层 offset。两处必须一致。"""
+    headers = sh
+    uid = _new_session(http_app, headers, "oh")
+
+    _, p1 = http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"abcd", headers={**headers, "Upload-Offset": "0"}
+    )
+    assert p1.headers["Upload-Offset"] == "4" and p1.json["offset"] == 4
+
+    _, st = http_app.test_client.get(f"/api/files/uploads/{uid}", headers=headers)
+    assert st.headers["Upload-Offset"] == "4" and st.json["offset"] == 4
+
+    _, bad = http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"zz", headers={**headers, "Upload-Offset": "99"}
+    )
+    assert bad.status == 409
+    assert bad.headers["Upload-Offset"] == "4", "409 必须用头带回真实 offset"
+    assert bad.json["offset"] == 4
+
+
+def test_empty_chunk_is_rejected(http_app, sh):
+    headers = sh
+    uid = _new_session(http_app, headers, "ec")
+    _, resp = http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"", headers={**headers, "Upload-Offset": "0"}
+    )
+    assert resp.status == 400
+
+
+def test_oversized_chunk_is_413_and_session_offset_stays_truthful(http_app, sh, monkeypatch):
+    from webx.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "UPLOAD_CHUNK_MAX_BYTES", 8)
+    headers = sh
+    uid = _new_session(http_app, headers, "bc")
+
+    _, resp = http_app.test_client.patch(
+        f"/api/files/uploads/{uid}", data=b"x" * 64, headers={**headers, "Upload-Offset": "0"}
+    )
+    assert resp.status == 413
+    _, st = http_app.test_client.get(f"/api/files/uploads/{uid}", headers=headers)
+    assert st.json["offset"] == 0, "被拒的分片不得推进 offset"
+
+
+def test_head_reports_length_and_range_support(http_app, sh):
+    headers = sh
+    body, ct = _multipart("h.bin", b"0123456789")
+    http_app.test_client.post("/api/files/hd", data=body, headers={**headers, **ct})
+
+    _, head = http_app.test_client.head("/api/files/hd/h.bin", headers=headers)
+    assert head.status == 200
+    assert head.headers["Content-Length"] == "10"
+    assert head.headers["Accept-Ranges"] == "bytes"
+    assert head.body in (b"", None)
+
+    _, missing = http_app.test_client.head("/api/files/hd/none.bin", headers=headers)
+    assert missing.status == 404
+
+    _, signed = http_app.test_client.post("/api/files/hd/h.bin/sign", headers=headers)
+    sign = signed.json["data"]["sign"]
+    _, pub = http_app.test_client.head(f"/public/files/hd/h.bin?sign={sign}")
+    assert pub.status == 200 and pub.headers["Content-Length"] == "10"
+    _, bad = http_app.test_client.head("/public/files/hd/h.bin?sign=garbage")
+    assert bad.status == 404
+
+
+def test_form_filename_field_overrides_file_part_name(http_app, sh):
+    headers = sh
+    boundary = "----fnb"
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"filename\"\r\n\r\nrenamed.txt\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"orig.txt\"\r\n"
+        f"Content-Type: text/plain\r\n\r\nhello\r\n--{boundary}--\r\n"
+    ).encode()
+    _, resp = http_app.test_client.post(
+        "/api/files/fn", data=body,
+        headers={**headers, "Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert resp.status == 201, resp.text
+    assert resp.json["data"]["filename"] == "renamed.txt"
+
+
+def test_reserved_dot_names_cannot_be_uploaded(http_app, sh):
+    """点开头是存储保留区：不能借上传写进 .uploads 这类内部目录。"""
+    headers = sh
+    body, ct = _multipart(".hidden", b"x")
+    _, resp = http_app.test_client.post("/api/files/dt", data=body, headers={**headers, **ct})
+    assert resp.status == 400
+    body, ct = _multipart("ok.txt", b"x")
+    _, resp = http_app.test_client.post("/api/files/.uploads", data=body, headers={**headers, **ct})
+    assert resp.status == 400

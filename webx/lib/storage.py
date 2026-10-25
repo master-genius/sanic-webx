@@ -30,8 +30,49 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 键的单段安全字符集：字母数字 + 下划线 / 连字符 / 点（禁 '/'、'..'、空）
-_SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+class KeyRule:
+    """对象键的单段命名规则。
+
+    所有规则共有的底线（不可配）：不得为空、不得是 ``.`` / ``..``、
+    **不得以 ``.`` 开头**（点开头的名字是存储自己的保留区，如 ``.uploads/``、
+    ``.staging/``，也避免把隐藏文件当业务对象暴露），不得含 NUL / 控制字符。
+    可配的只有字符集与单段长度。
+    """
+
+    def __init__(self, name: str, pattern: re.Pattern[str], max_bytes: int = 255):
+        self.name = name
+        self.pattern = pattern
+        self.max_bytes = max_bytes
+
+    def check(self, seg: str) -> bool:
+        if seg in (".", "..") or seg.startswith("."):
+            return False
+        if len(seg.encode("utf-8", errors="ignore")) > self.max_bytes:
+            return False
+        return bool(self.pattern.match(seg))
+
+    def __repr__(self) -> str:
+        return f"KeyRule({self.name})"
+
+
+#: 严格：字母数字 + ``_`` ``-`` ``.``（默认，适合机器生成的键）
+STRICT = KeyRule("strict", re.compile(r"^[A-Za-z0-9_.-]+$"))
+#: 宽松：任意可打印字符（含中文、空格、括号），仍排除路径分隔符与控制字符。
+#: 适合需要保留用户原始文件名的场景
+LENIENT = KeyRule("lenient", re.compile(r"^[^\x00-\x1f\x7f/\\]+$"))
+
+KEY_RULES = {"strict": STRICT, "lenient": LENIENT}
+
+
+def get_key_rule(name: str | KeyRule | None) -> KeyRule:
+    """按名字取规则；未知名字抛 ValueError（配置写错应当启动即暴露）。"""
+    if isinstance(name, KeyRule):
+        return name
+    key = (name or "strict").strip().lower()
+    if key not in KEY_RULES:
+        raise ValueError(f"未知的对象键规则 {name!r}，可选: {', '.join(KEY_RULES)}")
+    return KEY_RULES[key]
+
 
 # 流式写入的中间态前缀：列表时跳过，避免把半截文件暴露出去
 TMP_PREFIX = ".upload."
@@ -46,12 +87,13 @@ class StoreError(Exception):
         self.status = status
 
 
-def normalize_key(key: str) -> str:
+def normalize_key(key: str, rule: KeyRule | None = None) -> str:
     """校验并归一化对象键，返回 ``a/b/c.txt`` 形式。
 
-    逐段校验：任何一段不合法（含 ``..``、空段、路径分隔符、其他特殊字符）即拒绝。
-    这是第一道守卫，``ObjectStore.path_for`` 里还有第二道。
+    逐段校验：任何一段不合法（含 ``..``、空段、路径分隔符、点开头、其他特殊字符）
+    即拒绝。这是第一道守卫，``ObjectStore.path_for`` 里还有第二道。
     """
+    rule = rule or STRICT
     if not key or not isinstance(key, str):
         raise StoreError("对象键不能为空", status=400)
 
@@ -60,7 +102,7 @@ def normalize_key(key: str) -> str:
         raise StoreError(f"非法对象键: {key!r}", status=400)
 
     for seg in segments:
-        if seg in (".", "..") or not _SAFE_SEGMENT.match(seg):
+        if not rule.check(seg):
             raise StoreError(f"非法对象键片段: {seg!r}", status=400)
 
     return "/".join(segments)
@@ -69,8 +111,13 @@ def normalize_key(key: str) -> str:
 class ObjectStore:
     """本地对象存储。"""
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, key_rule: str | KeyRule | None = None):
         self.root = Path(root)
+        self.key_rule = get_key_rule(key_rule)
+
+    def normalize(self, key: str) -> str:
+        """按本存储的键规则归一化对象键。"""
+        return normalize_key(key, self.key_rule)
 
     def ensure_dirs(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -84,7 +131,7 @@ class ObjectStore:
         两道守卫：``normalize_key`` 逐段校验 + 解析后必须仍在存储根内
         （后者能挡住符号链接逃逸，前者挡不住）。
         """
-        key = normalize_key(key)
+        key = self.normalize(key)
         path = self.root / key
         try:
             path.resolve().relative_to(self.root.resolve())
@@ -127,10 +174,26 @@ class ObjectStore:
         try:
             path.unlink()
             logger.info("对象已删除: %s", key)
-            return True
         except OSError as e:
             logger.warning("删除对象失败: %s, error=%s", key, e)
             return False
+        self._prune_empty_parents(path.parent)
+        return True
+
+    def _prune_empty_parents(self, directory: Path) -> None:
+        """向上回收因删除而变空的目录，止于存储根（根本身永不删）。
+
+        多级键下不回收会留下一整串空目录；rmdir 只删空目录，
+        并发写入落进该目录时它自然失败，无需加锁。
+        """
+        root = self.root.resolve()
+        current = directory.resolve()
+        while current != root and root in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                return  # 非空或被并发使用，到此为止
+            current = current.parent
 
     def delete_prefix(self, prefix: str) -> bool:
         """递归删除整个前缀目录。"""
@@ -160,7 +223,7 @@ class ObjectStore:
 
     def save_bytes(self, key: str, data: bytes) -> Path:
         """一次性写入（小文件用）。同样走 .tmp + 原子落位。"""
-        key = normalize_key(key)
+        key = self.normalize(key)
         prefix, _, filename = key.rpartition("/")
         writer = self.open_writer(prefix or ".")
         try:
@@ -181,7 +244,7 @@ class ObjectWriter:
     def __init__(self, store: ObjectStore, prefix: str):
         self._store = store
         # 前缀此刻即校验（非法立抛），并确保目录存在
-        self._prefix = "" if prefix in (".", "") else normalize_key(prefix)
+        self._prefix = "" if prefix in (".", "") else store.normalize(prefix)
         self._dir = (store.root / self._prefix) if self._prefix else store.root
         self._dir.mkdir(parents=True, exist_ok=True)
 

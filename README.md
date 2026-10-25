@@ -491,6 +491,17 @@ register_permissions({
 `init_permissions()` 会把注册表同步进库，并删除代码里已移除的权限。
 注册表为空时**一律跳过**（不会误删）——空表意味着"还没注册"，不是"全删了"。
 
+**存储契约要点**（改动前先读）：
+
+- **断点续传客户端读 `Upload-Offset` 响应头**：分片的 `GET`/`PATCH`/`complete` 与 409 都带这个头，
+  同时在 JSON 顶层给 `offset`（`data.offset` 仍保留）。409 时头里就是服务端真实 offset，客户端据此重新对齐。
+- **分片限制**：单片不得超过 `UPLOAD_CHUNK_MAX_BYTES`（413），空分片回 400；被拒的分片不推进 offset。
+- **整传**用 python-multipart 的推式解析器（`webx/lib/multipart_stream.py`），可选表单字段 `filename` 覆盖文件部分的名字。
+- **键规则**：`STORAGE_KEY_RULE=strict|lenient`。任何规则下，**点开头的段都是保留区**（`.uploads/`、`.staging/`、
+  `.upload.*.tmp`），既不能写也不会被列出。
+- **HEAD**：`HEAD /api/files/<bucket>/<name>` 与签名链接的 HEAD 只回 `Content-Length` / `Accept-Ranges`。
+- **启动时**（只要挂了 `api` 或 `public` 组）自动建存储目录并回收超龄的分片会话。
+
 ## 未搬运的部分
 
 - **`openapi_enricher.py`**（原项目 816 行）：直接 import 业务 DTO 与具体控制器常量，

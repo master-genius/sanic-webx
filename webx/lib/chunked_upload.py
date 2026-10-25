@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from webx.lib.storage import ObjectStore, StoreError, normalize_key
+from webx.lib.storage import ObjectStore, StoreError
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ class ChunkedUpload:
             key: 目标对象键。**此刻即校验**——非法输入不该等到 complete 才暴露。
             total: 声明的总字节数；``-1`` 表示不声明，complete 时不校验长度。
         """
-        key = normalize_key(key)
+        key = self.store.normalize(key)
         upload_id = secrets.token_hex(16)
         sdir = self.sessions_dir / upload_id
         sdir.mkdir(parents=True, exist_ok=True)

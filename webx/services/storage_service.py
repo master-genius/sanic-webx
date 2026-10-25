@@ -44,7 +44,7 @@ class StorageService:
     @property
     def store(self) -> ObjectStore:
         if self._store is None:
-            self._store = ObjectStore(settings.storage_path)
+            self._store = ObjectStore(settings.storage_path, settings.STORAGE_KEY_RULE)
         return self._store
 
     @property
@@ -87,6 +87,23 @@ class StorageService:
         return self.signer.verify(sign, object_key)
 
     # ==================== 下载 ====================
+
+    @staticmethod
+    def head(path: Path, *, content_type: Optional[str] = None):
+        """HEAD 响应：只回头，不读文件体。
+
+        客户端据此在下载前拿到长度、确认支持 Range、做存在性探测。
+        """
+        import mimetypes
+
+        size = path.stat().st_size
+        mime = content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return text(
+            "",
+            status=200,
+            content_type=mime,
+            headers={"Content-Length": str(size), "Accept-Ranges": "bytes"},
+        )
 
     async def send(
         self,

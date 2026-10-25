@@ -150,6 +150,13 @@ class BaseSettings:
     UPLOAD_MAX_SIZE: int = field(
         default_factory=lambda: env.int("UPLOAD_MAX_SIZE", 100 * 1024 * 1024)
     )
+    # 单个分片的体积上限。分片是逐块追加到磁盘的，上限管的是单次请求的合理性
+    UPLOAD_CHUNK_MAX_BYTES: int = field(
+        default_factory=lambda: env.int("UPLOAD_CHUNK_MAX_BYTES", 64 * 1024 * 1024)
+    )
+    # 对象键的命名规则：strict（字母数字 _ - .，默认）/ lenient（允许中文、空格、括号，
+    # 仍排除路径分隔符与控制字符）。需要保留用户原始文件名时用 lenient
+    STORAGE_KEY_RULE: str = field(default_factory=lambda: env.str("STORAGE_KEY_RULE", "strict"))
     # 分片上传会话的最长存活时长；超龄未完成的会话在启动时被回收，防磁盘泄漏
     UPLOAD_SESSION_MAX_AGE_HOURS: float = field(
         default_factory=lambda: env.float("UPLOAD_SESSION_MAX_AGE_HOURS", 24.0)

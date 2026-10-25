@@ -522,3 +522,53 @@ def test_all_invalid_builtin_groups_fallback_warning_is_explicit(mkapp, caplog):
         mkapp(None, modules=["app"], builtin_controller=["nope"])
     assert "全部加载" in caplog.text
     assert "auth,api,admin,public" in caplog.text and "admin" in caplog.text
+
+
+# ==================== 存储启动接线 ====================
+
+
+def test_stale_upload_sessions_are_reclaimed_by_prepare_storage(tmp_path, monkeypatch):
+    """超龄分片会话的回收必须有调用点——写了函数没人调，等于磁盘泄漏。"""
+    import json
+    import time
+
+    from webx.config import get_settings
+    from webx.core import app as core_app
+    from webx.lib.chunked_upload import ChunkedUpload
+    from webx.lib.storage import ObjectStore
+    from webx.services.storage_service import storage_service
+
+    store = ObjectStore(tmp_path / "s")
+    monkeypatch.setattr(storage_service, "_store", store)
+    monkeypatch.setattr(storage_service, "_chunked", ChunkedUpload(store))
+    monkeypatch.setattr(get_settings(), "UPLOAD_SESSION_MAX_AGE_HOURS", 1.0)
+
+    storage_service.ensure_dirs()
+    old = storage_service.chunked.create("b/old.bin")["upload_id"]
+    fresh = storage_service.chunked.create("b/fresh.bin")["upload_id"]
+    meta = storage_service.chunked.sessions_dir / old / "meta.json"
+    data = json.loads(meta.read_text())
+    data["created_ms"] = int((time.time() - 3 * 3600) * 1000)
+    meta.write_text(json.dumps(data))
+
+    core_app._prepare_storage()
+
+    assert storage_service.chunked.get(old) is None, "超龄会话应被回收"
+    assert storage_service.chunked.get(fresh) is not None, "未超龄的不动"
+
+
+@pytest.mark.parametrize(
+    "builtin, expected",
+    [(True, 1), (["api"], 1), (["public"], 1), (["auth", "admin"], 0), (False, 0)],
+)
+def test_storage_is_prepared_only_when_a_storage_group_is_mounted(
+    mkapp, monkeypatch, builtin, expected
+):
+    from webx.core import app as core_app
+
+    calls = []
+    monkeypatch.setattr(core_app, "_prepare_storage", lambda: calls.append(1))
+    app = mkapp(None, modules=["app"], builtin_controller=builtin)
+    app.test_client.get("/health")  # 触发 before_server_start
+    assert len(calls) == expected
+

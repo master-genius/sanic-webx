@@ -231,3 +231,62 @@ def test_sign_from_other_secret_is_rejected():
     a = UrlSigner("secret-number-one-long-enough", 3600)
     b = UrlSigner("secret-number-two-long-enough", 3600)
     assert b.verify(a.issue("bucket/f.zip"), "bucket/f.zip") is False
+
+
+# ==================== 键规则 / 保留前缀 / 空目录回收 ====================
+
+from webx.lib.storage import LENIENT, STRICT, get_key_rule  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "key", [".uploads/x", "a/.hidden", ".staging/a.bin", "a/.upload.1.tmp"]
+)
+def test_dot_prefixed_segments_are_reserved(key):
+    """点开头的段是存储自己的保留区（.uploads/.staging/临时文件），任何规则都不许写。"""
+    for rule in (STRICT, LENIENT):
+        with pytest.raises(StoreError):
+            normalize_key(key, rule)
+
+
+def test_lenient_rule_keeps_user_filenames():
+    assert normalize_key("t1/results/任务 A_(坐标)_ligand1.zip", LENIENT) == (
+        "t1/results/任务 A_(坐标)_ligand1.zip"
+    )
+    with pytest.raises(StoreError):  # 严格规则仍然拒绝
+        normalize_key("t1/任务.zip", STRICT)
+
+
+@pytest.mark.parametrize("bad", ["a/b\x00c", "a/b\nc", "a/" + "x" * 300, "a/..", "a\\..\\b"])
+def test_lenient_rule_still_blocks_dangerous_segments(bad):
+    with pytest.raises(StoreError):
+        normalize_key(bad, LENIENT)
+
+
+def test_unknown_rule_name_fails_loudly():
+    with pytest.raises(ValueError):
+        get_key_rule("typo")
+    assert get_key_rule(None) is STRICT and get_key_rule("LENIENT") is LENIENT
+
+
+def test_store_uses_its_rule(tmp_path):
+    s = ObjectStore(tmp_path / "s", key_rule="lenient")
+    s.ensure_dirs()
+    s.save_bytes("b/中文 名.txt", b"x")
+    assert s.exists("b/中文 名.txt")
+    assert ObjectStore(tmp_path / "s").exists("b/中文 名.txt") is None  # 严格规则看不见
+
+
+def test_delete_prunes_empty_parents_but_never_the_root(store):
+    store.save_bytes("a/b/c/f.txt", b"x")
+    store.save_bytes("a/keep.txt", b"y")
+    assert store.delete("a/b/c/f.txt") is True
+    assert not (store.root / "a" / "b").exists(), "空的 c、b 应一并回收"
+    assert (store.root / "a" / "keep.txt").exists(), "非空目录不动"
+
+    assert store.delete("a/keep.txt") is True
+    assert not (store.root / "a").exists()
+    assert store.root.exists(), "存储根永不删除"
+
+
+def test_delete_missing_object_returns_false(store):
+    assert store.delete("nope/none.txt") is False

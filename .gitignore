@@ -30,3 +30,6 @@ CLAUDE.md
 /worker/worker-launch.sh
 /worker/worker.service
 /xymol.egg-info
+
+# uv 锁文件：本仓库不装成包，依赖版本由 pyproject 声明
+uv.lock

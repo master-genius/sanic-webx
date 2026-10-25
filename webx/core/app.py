@@ -159,6 +159,29 @@ def _admin_enabled(builtin_packages: Iterable[str]) -> bool:
     return any(p == "webx.controller" or p.endswith(".admin") for p in builtin_packages)
 
 
+def _storage_enabled(builtin_packages: Iterable[str]) -> bool:
+    """本次装配是否挂载了会用到文件存储的内置组（api 的文件端点、public 的签名下载）。"""
+    return any(
+        p == "webx.controller" or p.endswith((".api", ".public")) for p in builtin_packages
+    )
+
+
+def _prepare_storage() -> None:
+    """启动时建好存储目录，并回收超龄未完成的分片上传会话。
+
+    会话回收不接线就是磁盘泄漏：init 之后从不 complete 的会话会永久残留。
+    多 worker 各跑一次是安全的（rmtree 幂等，竞态由回收函数内部兜住）。
+    存储不可用不该拖垮整个服务——其余路由照常，只是文件端点会各自报错——所以只记 ERROR。
+    """
+    from webx.services.storage_service import storage_service
+
+    try:
+        storage_service.ensure_dirs()
+        storage_service.cleanup_stale_uploads()
+    except OSError as e:
+        logger.error("存储初始化失败（文件相关端点将不可用）: %s", e)
+
+
 def register_admin_permissions() -> None:
     """把内置管理端的权限定义写进注册表（纯内存、幂等）。
 
@@ -304,12 +327,15 @@ def create_app(
     if _admin_enabled(builtin_packages):
         register_admin_permissions()
     shutdown_hooks = list(on_shutdown)
+    prepare_storage = _storage_enabled(builtin_packages)
 
     @app.before_server_start
     async def _startup(app: Sanic):
         setup_cors(app)
         if use_db:
             await init_db(app)
+        if prepare_storage:
+            _prepare_storage()
         for hook in startup_hooks:
             await hook(app)
         logger.info("✅ 服务启动 PID=%s", os.getpid())
