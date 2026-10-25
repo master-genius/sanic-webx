@@ -34,9 +34,22 @@ from tortoise import Tortoise  # noqa: E402
 TEST_MODELS = ["app.models", "webx.models"]
 
 
+def reset_orm_caches() -> None:
+    """清掉 Tortoise 按 (连接名, schema, 表名) 缓存的 INSERT / UPDATE 语句。
+
+    这个缓存**不区分数据库方言**：同一进程里先用 sqlite 建过模型、再切到 PostgreSQL，
+    模型会拿着 sqlite 风格的 SQL 去打 PG（反过来亦然），报莫名其妙的语法错误。
+    生产里一个进程只连一种库，不受影响；只有本测试套件 sqlite 与 PG 混用时才需要。
+    """
+    from tortoise.backends.base.executor import EXECUTOR_CACHE
+
+    EXECUTOR_CACHE.clear()
+
+
 @pytest.fixture
 async def db():
     """每个用例一套全新的内存库，用例之间互不污染。"""
+    reset_orm_caches()
     await Tortoise.init(db_url="sqlite://:memory:", modules={"models": TEST_MODELS})
     await Tortoise.generate_schemas()
     try:
@@ -150,6 +163,7 @@ def app_with_db(tmp_path_factory):
     async def init_sqlite(sanic_app):
         # _enable_global_fallback 与 webx.core.db.init_db 同款：启动钩子跑在后台任务里、
         # 请求处理在另一批任务里，不开这个开关请求期就拿不到连接
+        reset_orm_caches()
         await Tortoise.init(
             db_url=db_url, modules={"models": TEST_MODELS}, _enable_global_fallback=True
         )
@@ -176,3 +190,55 @@ def app_with_db(tmp_path_factory):
         yield application
     finally:
         Sanic._app_registry.clear()
+
+
+# ==================== PostgreSQL（认领 / 租约的 SQL 是 PG 专有的）====================
+
+
+@pytest.fixture(scope="session")
+def pg_dsn(tmp_path_factory):
+    """会话级：拿到一个可用的 PG 的 DSN（见 tests/pg_server.py 的获取顺序）。
+
+    拿不到时测试**失败**而不是跳过——跳过会让认领逻辑"没被验证却显示绿色"。
+    确需跳过请显式设 WEBX_SKIP_PG_TESTS=1。
+    """
+    import os
+
+    if os.environ.get("WEBX_SKIP_PG_TESTS") == "1":
+        pytest.skip("WEBX_SKIP_PG_TESTS=1：显式跳过需要 PostgreSQL 的测试")
+
+    url = os.environ.get("WEBX_TEST_PG_URL")
+    if url:
+        yield url
+        return
+
+    from tests.pg_server import PgUnavailable, start_pg
+
+    try:
+        inst = start_pg(tmp_path_factory.mktemp("pg"))
+    except PgUnavailable as e:
+        pytest.fail(f"需要 PostgreSQL 才能验证认领 / 租约逻辑，但环境里拿不到:\n{e}", pytrace=False)
+    try:
+        yield inst.dsn
+    finally:
+        inst.stop()
+
+
+@pytest.fixture
+async def pgdb(pg_dsn):
+    """函数级：连上 PG、建表、建认领索引、清空数据。每个用例拿到一个干净的库。"""
+    from webx.models.task import Task
+
+    reset_orm_caches()
+    await Tortoise.init(db_url=pg_dsn, modules={"models": TEST_MODELS}, _enable_global_fallback=True)
+    await Tortoise.generate_schemas(safe=True)
+    conn = Tortoise.get_connection("default")
+    await conn.execute_query(Task.CLAIM_INDEX_DDL)
+    tables = [m._meta.db_table for app in Tortoise.apps.values() for m in app.values()]
+    quoted = ", ".join(f'"{t}"' for t in tables)
+    await conn.execute_query(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE")
+    try:
+        yield conn
+    finally:
+        await Tortoise.close_connections()
+

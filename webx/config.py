@@ -254,6 +254,61 @@ class BaseSettings:
         default_factory=lambda: env.int("TASK_WAITING_PARENT_MAX", 10)
     )
 
+    # ==================== 租约 / 分发 ====================
+    # ⚠️ 租约参数的单一来源是这里：领取服务（写短租约）、Web（续租）、补偿器（回收）三个进程各读各的，
+    # 但读的是同一份配置。三处若各存一份副本，漂移会让 worker 的自熔时刻与服务端的回收时刻错位——
+    # 即"服务端已租给 B、A 仍认为自己持有"的窗口。
+    #
+    # 认领时的短租约：兜住"领取响应丢在路上"。worker 首次 ack 后续到常规租约
+    LEASE_CLAIM_SECONDS: int = field(default_factory=lambda: env.int("LEASE_CLAIM_SECONDS", 60))
+    # 常规租约：每次心跳把到期时刻推到 now + LEASE_SECONDS + grace
+    LEASE_SECONDS: int = field(default_factory=lambda: env.int("LEASE_SECONDS", 100))
+    # grace = clamp(α × 已投入时长, MIN, MAX)。误抢占的损失 = 接手方要从当前步骤开头重跑 = 已投入时长，
+    # 所以跑得越久越有耐心；MIN 覆盖网络抖动（与任务无关，该固定），MAX 防无限增长
+    LEASE_GRACE_ALPHA: float = field(default_factory=lambda: env.float("LEASE_GRACE_ALPHA", 0.12))
+    LEASE_GRACE_MIN_SECONDS: int = field(default_factory=lambda: env.int("LEASE_GRACE_MIN_SECONDS", 180))
+    LEASE_GRACE_MAX_SECONDS: int = field(default_factory=lambda: env.int("LEASE_GRACE_MAX_SECONDS", 18000))
+    # 连续无进展的被动重投上限，超限直接判失败
+    LEASE_REQUEUE_LIMIT: int = field(default_factory=lambda: env.int("LEASE_REQUEUE_LIMIT", 10))
+
+    # 领取服务（task_server）：Web / 补偿器通过它的 URL "戳"一下；worker 通过反代访问它的 /task/leases
+    TASK_SERVER_URL: str = field(default_factory=lambda: env.str("TASK_SERVER_URL", "http://127.0.0.1:9020"))
+    TASK_SERVER_HOST: str = field(default_factory=lambda: env.str("TASK_SERVER_HOST", "127.0.0.1"))
+    TASK_SERVER_PORT: int = field(default_factory=lambda: env.int("TASK_SERVER_PORT", 9020))
+    # 单次领取请求最长挂起（秒）。必须小于反代的 proxy_read_timeout，否则连接会被反代掐断；
+    # 被掐断也不损失正确性——挂起中的请求尚未认领任何任务
+    TASK_LEASE_HOLD_SECONDS: float = field(default_factory=lambda: env.float("TASK_LEASE_HOLD_SECONDS", 25.0))
+    # 挂起期间的兜底重试间隔：唤醒（poke）是主路径，这只是兜住"poke 丢了"的安全网
+    TASK_LEASE_FALLBACK_SECONDS: float = field(
+        default_factory=lambda: env.float("TASK_LEASE_FALLBACK_SECONDS", 1.0)
+    )
+
+    # ==================== 补偿器 ====================
+    RECONCILER_SCAN_INTERVAL: int = field(default_factory=lambda: env.int("RECONCILER_SCAN_INTERVAL", 600))
+    RECONCILER_STALE_THRESHOLD_MINUTES: int = field(
+        default_factory=lambda: env.int("RECONCILER_STALE_THRESHOLD_MINUTES", 60)
+    )
+    RECONCILER_QUEUED_TIMEOUT_MINUTES: int = field(
+        default_factory=lambda: env.int("RECONCILER_QUEUED_TIMEOUT_MINUTES", 60)
+    )
+    RECONCILER_ABANDON_THRESHOLD_HOURS: int = field(
+        default_factory=lambda: env.int("RECONCILER_ABANDON_THRESHOLD_HOURS", 168)
+    )
+    RECONCILER_NONE_TASK_TIMEOUT_HOURS: int = field(
+        default_factory=lambda: env.int("RECONCILER_NONE_TASK_TIMEOUT_HOURS", 3)
+    )
+    RECONCILER_ADMIT_INTERVAL: int = field(default_factory=lambda: env.int("RECONCILER_ADMIT_INTERVAL", 30))
+    # 租约回收循环：秒级点查，独立于上面的慢扫描，绝不可合并
+    RECONCILER_LEASE_INTERVAL: int = field(default_factory=lambda: env.int("RECONCILER_LEASE_INTERVAL", 5))
+
+    # ==================== 存储服务（客户端侧）====================
+    # 任务模块调用独立存储服务（删除任务产物等）。未配置 URL = 静默跳过远端删除，
+    # 只清本地（同机部署时恰好是同一棵目录树）
+    STORAGE_INTERNAL_URL: str = field(default_factory=lambda: env.str("STORAGE_INTERNAL_URL", ""))
+    STORAGE_INTERNAL_TOKEN: str = field(
+        default_factory=lambda: env.str("STORAGE_INTERNAL_TOKEN", env.str("INTERNAL_TOKEN", ""))
+    )
+
     # ==================== 派生属性 ====================
 
     @property

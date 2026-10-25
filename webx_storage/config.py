@@ -22,11 +22,8 @@ class StorageSettings(BaseSettings):
     STORAGE_WORKERS: int = field(default_factory=lambda: env.int("STORAGE_WORKERS", 1))
 
     # ==================== 内部鉴权 ====================
-    # 服务间调用的 X-Internal-Token。优先 STORAGE_INTERNAL_TOKEN，回退通用 INTERNAL_TOKEN。
+    # 服务间调用的 X-Internal-Token 用 BaseSettings.STORAGE_INTERNAL_TOKEN（回退通用 INTERNAL_TOKEN）。
     # ⚠️ 两者都为空时**拒绝一切内部请求**（空配置绝不能等价于放行），并在启动时告警。
-    STORAGE_INTERNAL_TOKEN: str = field(
-        default_factory=lambda: env.str("STORAGE_INTERNAL_TOKEN", env.str("INTERNAL_TOKEN", ""))
-    )
 
     # ==================== 键策略 ====================
     # 启用哪些键策略（逗号分隔）。通用的 /internal/objects 恒有；策略在其上追加

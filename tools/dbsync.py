@@ -46,6 +46,13 @@ async def _sync(args: argparse.Namespace) -> int:
         debug=args.debug,
         schema=args.schema or settings.DATABASE_SCHEMA,
     )
+
+    # 认领热点索引不由 Tortoise 声明（混合排序方向表达不了），--force 同步还会把它当野索引清掉；
+    # 同步完补一次，保证认领不会悄悄退化成全表扫描。幂等。
+    if "webx.models" in models:
+        from webx.services.lease import ensure_claim_index
+
+        print(f"🔎 认领热点索引: {await ensure_claim_index()}")
     return 0
 
 
