@@ -36,8 +36,9 @@ const logger = getLogger('executor')
 const limits = { DRAIN_GRACE_SEC: 2.0 }
 const SAFE_NAME = /^[A-Za-z0-9._-]+$/
 
+/** SIGTERM → SIGKILL 的宽限（秒）：走配置分层（.env / 覆盖层 / 环境变量），负数按默认 */
 function killGraceSeconds() {
-  const v = Number(process.env.WEBX_WORKER_KILL_GRACE_SECONDS)
+  const v = settings.KILL_GRACE_SECONDS
   return Number.isFinite(v) && v >= 0 ? v : 3.0
 }
 
@@ -46,6 +47,11 @@ function killGroup(pid, sig) {
   if (!pid) return
   try { process.kill(-pid, sig) } catch (_) { /* ESRCH / EPERM */ }
 }
+
+/** 存活的任务进程组（pgid == pid）。进程退出时同步 SIGKILL 兜底：cdpc 的 exit 钩子只发 SIGTERM，
+ *  忽略 SIGTERM 的子进程会在 worker 退出后变成孤儿 */
+const liveGroups = new Set()
+process.on('exit', () => { for (const pid of liveGroups) killGroup(pid, 'SIGKILL') })
 
 const isoNow = () => new Date().toISOString()
 
@@ -384,7 +390,8 @@ class GenericTaskExecutor {
     const logPath = path.join(workDir, logFilename)
     const childEnv = this._buildChildEnv(env)
     const cm = getManager()
-    const name = `task_${taskId.replace(/[^A-Za-z0-9_]/g, '_')}_${++this.procSeq}`
+    // 名字带 pid + 启动时刻：重启后不会与上一轮遗留的 pid 文件同名（cdpc 同名 detached 会接管旧进程）
+    const name = `task_${taskId.replace(/[^A-Za-z0-9_]/g, '_')}_${process.pid}_${Date.now().toString(36)}_${++this.procSeq}`
     const grace = killGraceSeconds()
 
     logger.info(`启动子进程 task_id=${taskId} cmd=${cmd.join(' ')}`)
@@ -419,6 +426,7 @@ class GenericTaskExecutor {
       options: { cwd: workDir, env: childEnv, detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
       callback: (ch) => {
         child = ch
+        if (ch.pid) liveGroups.add(ch.pid)
         for (const stream of [ch.stdout, ch.stderr]) {
           if (!stream) continue
           const f = feeder()
@@ -482,6 +490,7 @@ class GenericTaskExecutor {
       clearTimeout(timeoutTimer)
       // 一切 await 之前同步兜底：即便展开途中被打断，也不泄漏算力
       if (!exited.isSet()) killGroup(pid(), 'SIGKILL')
+      liveGroups.delete(pid()) // 此后进程组已清理完毕；留着会在退出钩子里误杀被复用的 pid
       for (const s of child ? [child.stdout, child.stderr] : []) { try { s && s.destroy() } catch (_) { /* 已关闭 */ } }
       try { await chain } catch (_) { /* 日志链永不抛 */ }
       try { cm.remove(name) } catch (_) { /* 已被清理 */ }

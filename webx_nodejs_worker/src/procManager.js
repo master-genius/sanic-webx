@@ -23,6 +23,10 @@ function getManager() {
   if (process.listenerCount('SIGHUP') === 0) process.on('SIGHUP', () => {})
   const stateDir = path.join(settings.WORK_DIR, '.cdpc')
   fs.mkdirSync(stateDir, { recursive: true })
+  // 清掉上一轮遗留的 pid 文件：cdpc 对同名 detached 服务会「接管」仍存活的旧进程且不调用 callback，
+  // executor 将永远等不到退出事件。WORK_DIR 按约定由实例独占（K4），清理是安全的
+  const pidsDir = path.join(stateDir, 'pids')
+  try { for (const f of fs.readdirSync(pidsDir)) fs.rmSync(path.join(pidsDir, f), { force: true }) } catch (_) { /* 目录不存在 */ }
   manager = new CDPC({ debug: false, notExit: true, allowDetached: true, stateDir })
   return manager
 }

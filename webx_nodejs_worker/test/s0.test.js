@@ -40,6 +40,15 @@ test('配置分层：环境变量 > 覆盖层 > .env；worker_id 派生稳定', 
   cfg.resetFileLayers()
 })
 
+test('KILL_GRACE_SECONDS 走配置分层（.env 可设，非法值回默认）', () => {
+  const d = tmp()
+  fs.writeFileSync(path.join(d, '.env'), 'WEBX_WORKER_KILL_GRACE_SECONDS=7.5\n')
+  cfg.loadBaseEnv(path.join(d, '.env'))
+  assert.equal(cfg.settings.KILL_GRACE_SECONDS, 7.5)
+  cfg.resetFileLayers()
+  assert.equal(cfg.settings.KILL_GRACE_SECONDS, 3)
+})
+
 test('leaseFilters：空串=不限，0 有意义', () => {
   cfg.settings.LEASE_MAX_LEVEL = '0'
   cfg.settings.LEASE_MAX_COMPUTE_POINTS = ''

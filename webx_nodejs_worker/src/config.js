@@ -109,6 +109,7 @@ function buildSettings() {
     LOG_DIR: str('WEBX_WORKER_LOG_DIR'),
     LOG_MAX_BYTES: int('WEBX_WORKER_LOG_MAX_BYTES', 10 * 1024 * 1024),
     LOG_MAX_LINES: int('WEBX_WORKER_LOG_MAX_LINES', 20000),
+    KILL_GRACE_SECONDS: float('WEBX_WORKER_KILL_GRACE_SECONDS', 3.0),   // 终止子进程：SIGTERM → 宽限 → SIGKILL（Node 版新增）
   }
 }
 

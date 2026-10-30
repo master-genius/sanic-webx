@@ -37,7 +37,7 @@ node <repo>/webx_nodejs_worker/bin/webx-worker.js            # 运行（等价�
 子命令：`run`（缺省）｜`cleanup`｜`uploader`（由 worker 拉起，勿手动）｜`service`｜`doctor`｜`selftest`。
 命令行：`--home` `--config` `--ext-env` `--work-dir` `--debug` `--log`；未知参数被忽略并告警。
 配置项、优先级（真实环境变量 > 实例覆盖层 `<配置名>_env` > `<主目录>/.env` > 默认）、`.env` 语法、`worker_id` 派生规则
-与 `worker.md` §6 完全一致。新增一项：`WEBX_WORKER_KILL_GRACE_SECONDS`（默认 3，终止子进程的 SIGTERM→SIGKILL 宽限）。
+与 `worker.md` §6 完全一致。新增一项：`WEBX_WORKER_KILL_GRACE_SECONDS`（默认 3，终止子进程的 SIGTERM→SIGKILL 宽限；同样走 `.env` / 覆盖层 / 环境变量分层）。
 
 ## 2. 目录布局
 
@@ -100,7 +100,7 @@ SDK 导出：`uploadResult / updateTaskFields / updateStepStatus / downloadArtif
 
 ```bash
 cd webx_nodejs_worker
-npm test                              # 约 30 秒：单元 + 真进程 e2e + 跨实现验证
+npm test                              # 约 50 秒：单元 + 真进程 e2e + 跨实现验证
 node bin/webx-worker.js selftest      # 本机完整生命周期（14 项）
 node bin/webx-worker.js doctor ...    # 对真实服务自检，不领取任务
 ```
@@ -108,13 +108,18 @@ node bin/webx-worker.js doctor ...    # 对真实服务自检，不领取任务
 测试刻意做得轻量（基本覆盖主路径与关键边界，不是 Python 的 6900 行测试的逐条移植）：
 
 - `test/*.test.js`：各模块单元测试，共用 `src/fakeServer.js`（协议参考实现，写端点强制 fencing、旧路径 404、撤销回 200 revoked）；
-- `test/e2e.test.js`：真 worker 子进程 + 真信号——取消、租约吊销、超时、SIGTERM 停机归还租约，并检查孙进程被清掉；
+- `test/e2e.test.js`：真 worker 子进程 + 真信号——取消、租约吊销、超时、SIGTERM 停机归还租约、输入文件下载（含 redo 读到新内容）、
+  忽略 SIGTERM 的子进程在取消 / 停机下被 SIGKILL 升级杀掉（含孙进程），并检查不遗留孤儿；
 - `test/crossimpl.test.js`：Node worker 对 **Python 的 `FakeTaskServer`** 跑完整生命周期（需要 `python3`，否则跳过），
   用来防止两个实现各自「自洽地漂移」；
 - 变异验证（改坏 → 变红 → 还原）：去掉 `executor` 的 fencing 令牌注入 ⇒ `selftest` 的「写请求带令牌」「无 fencing 拒绝」两项变红。
 
 ## 6. 尚未覆盖 / 已知缺口
 
+- **worker 被 SIGKILL / 崩溃时，在跑的任务子进程会成为孤儿继续运行**（与 Python 版相同）：租约到期后任务会被重投，孤儿与新一轮可能同时计算。
+  cdpc 对同名 detached 服务会「接管」仍存活的旧进程且不触发 `callback`，所以 Node 版把进程名做成 `task_<id>_<pid>_<启动时刻>_<序号>`，
+  并在启动时清掉 `<WORK_DIR>/.cdpc/pids/`，避免重启后撞名被接管；但**不会**主动杀掉这些孤儿。
+- 正常退出路径靠 `terminate()` 的 SIGTERM→SIGKILL 升级清理；另有 `process.on('exit')` 同步 SIGKILL 存活进程组作兜底（目前没有用例单独证明它承重）。
 - `httpFileClient` 直接用 gohttp 的 `download`（`httpClient.request` 会整体缓冲响应，不适合大输入文件），观测手动喂给 `linkHealth`；
   SDK 的 `downloadArtifactStream` 用 `node:http(s)` 实现流式 + Range 续传。后续可在 `httpClient` 加流式 `download()` 收口。
 - `uploader` 进程未加载 `linkHealth`，其存储上传遇到的 401 / TLS 不进「链路健康」告警。
