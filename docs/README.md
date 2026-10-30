@@ -11,6 +11,7 @@
 | 对接任务接口（创建、提交、状态机、注册任务类型、配额与点数接缝） | [`task-api.md`](task-api.md) |
 | 理解租约、认领、fencing、补偿器、领取服务的设计与不变量 | [`task-scheduling.md`](task-scheduling.md) |
 | 写 / 改 worker，或自己实现一个兼容的客户端 | 协议：[`worker-protocol.md`](worker-protocol.md)；实现与配置：[`worker.md`](worker.md) |
+| 用 Node.js 版 worker（与 Python 版同协议，含差异清单） | [`worker-nodejs.md`](worker-nodejs.md) |
 | 用存储服务、写键策略、配保留期清理 | [`storage-service.md`](storage-service.md) |
 | 框架本身（自动蓝图、中间件、令牌、配置、短信） | 仓库根 [`../README.md`](../README.md) |
 
