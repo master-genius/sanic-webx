@@ -32,3 +32,4 @@ uv.lock
 
 # 并行工作的代理 worktree（临时目录，不入库）
 /.claude/
+/**/node_modules/

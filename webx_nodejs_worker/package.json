@@ -1,0 +1,23 @@
+{
+  "name": "webx-nodejs-worker",
+  "version": "0.1.0",
+  "description": "webx_worker 的 Node.js 实现：与任务服务只通过 HTTP 通信的租约 + fencing 异构算力 worker",
+  "private": true,
+  "main": "src/index.js",
+  "bin": {
+    "webx-nodejs-worker": "bin/webx-worker.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
+    "selftest": "node bin/webx-worker.js selftest"
+  },
+  "dependencies": {
+    "cdpc": "^6.3.0",
+    "gohttp": "^7.0.0",
+    "hydra-thread": "^1.0.1",
+    "topbit": "^3.8.3"
+  }
+}
